@@ -34,6 +34,8 @@ fi
 docker run --rm -u "$U" -v "$PWD":/w -v "$MPC_VST":/mv:ro "${FONT_MOUNT[@]}" "${FONT_ENV[@]}" -w /w python:3.11-slim sh -c \
   "pip install -q --no-warn-script-location --target /tmp/p pillow >/dev/null 2>&1; PYTHONPATH=/tmp/p python3 /mv/tools/gen_vst.py vst.json"
 
+cp "$MPC_VST/wrapper/popup.h" build/   # popup open-flag handling shared with mpc-vst's own wrapper
+
 # 3. the plugin (armhf, glibc 2.36 so it loads on the device's 2.39)
 docker run --rm --platform linux/arm/v7 -v "$PWD/..":/b -w /b/vst arm32v7/gcc:12 bash -euxc '
   apt-get update -qq && apt-get install -y -qq libasound2-dev >/dev/null

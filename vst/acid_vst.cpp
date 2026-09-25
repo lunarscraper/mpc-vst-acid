@@ -33,6 +33,7 @@ extern "C" {
 #include "acid_core.h"
 }
 #include "params.h"
+#include "popup.h"    /* mpc-vst-plugins wrapper/popup.h, copied into build/ by build.sh */
 
 /* ---- VST2 ABI (hand-written; no Steinberg SDK) ---------------------------- */
 struct AEffect;
@@ -102,6 +103,7 @@ struct Plugin {
     void *inst = nullptr;
     std::mutex lock;               /* serialises every call into the core */
     volatile char release[NPARAMS] = {0};
+    float open[NPARAMS] = {0};     /* popup "open" flags (popup.h): wrapper-only, not saved */
     double last_ppq = 0.0;
     bool was_playing = false;
     snd_seq_t *seq = nullptr;
@@ -133,6 +135,7 @@ static float str_to_norm(const param_t *p, const char *s) {
 static float get_norm(Plugin *w, int i) {
     char buf[64];
     int n;
+    if (popup_is(i)) return w->open[i];
     { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
     return n > 0 ? str_to_norm(&PARAMS[i], buf) : PARAMS[i].def;
 }
@@ -256,6 +259,7 @@ static void setParameter(AEffect *e, int32_t i, float n) {
     Plugin *w = (Plugin *)e->object;
     if (i < 0 || i >= NPARAMS) return;
     const param_t *p = &PARAMS[i];
+    if (popup_set(w->open, i, n)) return;
     if (p->momentary) {
         if (n > 0.5f) {
             std::lock_guard<std::mutex> lk(w->lock);
@@ -265,6 +269,7 @@ static void setParameter(AEffect *e, int32_t i, float n) {
         return;
     }
     char buf[32];
+    bool nudge = false;
     if (p->nopts > 1) {
         /* An exact option value selects it; anything between options is a
          * Q-Link/encoder nudge from the current one -- step one option that
@@ -276,11 +281,15 @@ static void setParameter(AEffect *e, int32_t i, float n) {
             if (idx < 0) idx = 0;
             if (idx > p->nopts - 1) idx = p->nopts - 1;
             n = (float)idx / (p->nopts - 1);
+            nudge = true;
         }
     }
     norm_to_str(p, n, buf, sizeof buf);
-    std::lock_guard<std::mutex> lk(w->lock);
-    g_api->set_param(w->inst, p->key, buf);
+    {
+        std::lock_guard<std::mutex> lk(w->lock);
+        g_api->set_param(w->inst, p->key, buf);
+    }
+    if (!nudge) popup_picked(w->open, w->release, i);   /* a list pick closes it; a Q-Link nudge doesn't */
 }
 
 static float getParameter(AEffect *e, int32_t i) { return get_norm((Plugin *)e->object, i); }
@@ -348,7 +357,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
     case effGetChunk: {
         std::string s;
         for (int i = 0; i < NPARAMS; i++) {
-            if (PARAMS[i].momentary) continue;
+            if (PARAMS[i].momentary || popup_is(i)) continue;
             char buf[32];
             int n;
             { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
