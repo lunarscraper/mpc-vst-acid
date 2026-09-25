@@ -1,0 +1,43 @@
+{
+  "_comment": "Not a real Schwung module -- chain_params here transcribes host_shim.cpp's PARAMS[] table verbatim (same order, same CC-MAP.md ranges) so tools/gen_vst.py can generate params.h + the skin for the VST port. Keep in sync by hand with host_shim.cpp and docs/CC-MAP.md.",
+  "chain_params": [
+    { "key": "a_generate", "name": "Generate", "access": "write" },
+    { "key": "a_mutate",   "name": "Mutate",   "access": "write" },
+    { "key": "a_density",  "name": "Density",  "min": 0.0,  "max": 1.0 },
+    { "key": "a_accent",   "name": "Accent",   "min": 0.0,  "max": 1.0 },
+    { "key": "a_slide",    "name": "Slide",    "min": 0.0,  "max": 1.0 },
+    { "key": "a_octaves",  "name": "Octaves",  "min": 1,    "max": 3 },
+    { "key": "a_length",   "name": "Length",   "min": 2,    "max": 32 },
+    { "key": "a_gate",     "name": "Gate",     "min": 0.05, "max": 1.0 },
+    { "key": "a_channel",  "name": "Channel",  "min": 1,    "max": 16 },
+    { "key": "a_offset",   "name": "Offset",   "min": 0,    "max": 31 },
+    { "key": "a_dir",      "name": "Dir",      "options": ["FWD", "REV", "PENDUL"] },
+    { "key": "a_auto_gen", "name": "Regen",    "options": ["OFF", "1 BAR", "2 BARS", "4 BARS", "8 BARS", "16 BARS", "32 BARS"] },
+    { "key": "a_dump",     "name": "Export",   "access": "write" },
+
+    { "key": "b_generate", "name": "Generate", "access": "write" },
+    { "key": "b_mutate",   "name": "Mutate",   "access": "write" },
+    { "key": "b_density",  "name": "Density",  "min": 0.0,  "max": 1.0 },
+    { "key": "b_accent",   "name": "Accent",   "min": 0.0,  "max": 1.0 },
+    { "key": "b_slide",    "name": "Slide",    "min": 0.0,  "max": 1.0 },
+    { "key": "b_octaves",  "name": "Octaves",  "min": 1,    "max": 3 },
+    { "key": "b_length",   "name": "Length",   "min": 2,    "max": 32 },
+    { "key": "b_gate",     "name": "Gate",     "min": 0.05, "max": 1.0 },
+    { "key": "b_channel",  "name": "Channel",  "min": 1,    "max": 16 },
+    { "key": "b_offset",   "name": "Offset",   "min": 0,    "max": 31 },
+    { "key": "b_dir",      "name": "Dir",      "options": ["FWD", "REV", "PENDUL"] },
+    { "key": "b_auto_gen", "name": "Regen",    "options": ["OFF", "1 BAR", "2 BARS", "4 BARS", "8 BARS", "16 BARS", "32 BARS"] },
+    { "key": "b_dump",     "name": "Export",   "access": "write" },
+
+    { "key": "scale",      "name": "Scale",      "options": ["MINOR", "PHRYGIAN", "HARM MIN", "MIN PENT", "DORIAN", "MAJOR", "PHRYG DOM", "LOCRIAN", "WHOLE TONE", "HUNG MIN", "MIN BLUES", "CHROMATIC"] },
+    { "key": "root",       "name": "Root",       "options": ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] },
+    { "key": "b_tune",     "name": "B Tune",     "min": -24, "max": 24 },
+    { "key": "blend",      "name": "Blend A>B",  "min": -63, "max": 64 },
+    { "key": "a_algo",     "name": "Algo A",     "min": 1,   "max": 16 },
+    { "key": "b_algo",     "name": "Algo B",     "min": 1,   "max": 16 },
+    { "key": "reset_bars", "name": "Reset",      "options": ["1 BAR", "2 BARS", "4 BARS", "8 BARS", "OFF"] },
+    { "key": "swing",      "name": "Swing",      "min": 50,  "max": 75 },
+    { "key": "jitter",     "name": "Jitter",     "min": 0.0, "max": 1.0 },
+    { "key": "cv_mode",    "name": "CV Mode",    "options": ["OFF", "ON"] }
+  ]
+}
