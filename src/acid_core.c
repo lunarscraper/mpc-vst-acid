@@ -202,7 +202,8 @@ typedef struct {
                            * separate from `root` so playing notes (or an echo of
                            * our own output) never moves the Root knob/field */
     int scale;            /* index into SCALES */
-    int blend;             /* -63..64, bipolar velocity crossfade A<->B */
+    int blend;             /* -63..64, A<->B; meaning depends on blend_mode */
+    int blend_mode;        /* BM_* -- see blend_pick(); 0 = Layer (the original) */
     int reset_bars_idx;   /* 0..3 -> {1,2,4,8} bars, 4 = Off */
     /* FORCE-ONLY: CV Mode -- retargets both sequencers' output for a Force CV
      * track feeding external CV/Gate/Accent/Slide hardware (e.g. a Behringer
@@ -524,6 +525,53 @@ static void compute_blend_velocities(int blend, int *vel_a, int *vel_b) {
     if (*vel_b > 127) *vel_b = 127;
 }
 
+/* Blend Mode (ported from schwung-acid v1.2.0). Layer is the original
+ * behaviour above -- both sequencers sound at once, Blend crossfading their
+ * velocities -- and stays the default: on Force it is what makes per-seq
+ * output channels (a_channel/b_channel) and CV Mode's separate hardware
+ * useful. Every other mode instead decides, per step, WHICH sequencer is
+ * audible (the other is muted, which also kills its ringing note), so the
+ * output is a single monophonic line. Blend then sweeps w = 0 (A alone) ..
+ * 1 (B alone) using a fixed per-step threshold (a bit-reversed 16-step
+ * order) so the hand-over between sources is even and repeatable, never
+ * random.
+ *   Morph -- each step comes from A or B.
+ *   Split -- rhythm (note/rest/slide/accent) always from A; pitch from B
+ *            on the steps the threshold hands to B.
+ *   Fill  -- OR, A priority: B plays where A rests.
+ *   XOR   -- plays where exactly one of A/B has a note.
+ *   Lock  -- AND: plays (A's note) only where both have a note.
+ * The logic modes sweep A -> logic result (centre) -> B. */
+enum { BM_LAYER = 0, BM_MORPH, BM_SPLIT, BM_FILL, BM_XOR, BM_LOCK, NUM_BLEND_MODES };
+
+static const uint8_t BLEND_THRESH[16] = { 0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15 };
+
+/* Audible sequencer for this step: 0 = A, 1 = B, -1 = silence. gate_a/gate_b:
+ * does that sequencer have a note on this step. *pitch_from_b is set only
+ * for Split. Not used in Layer mode. */
+static int blend_pick(const acid_inst_t *t, int gate_a, int gate_b, int *pitch_from_b) {
+    float w = (float)(t->blend + 63) / 127.0f;
+    if (w < 0.0f) w = 0.0f;
+    if (w > 1.0f) w = 1.0f;
+    float thr = ((float)BLEND_THRESH[t->swing_pulse_idx & 15] + 0.5f) / 16.0f;
+    *pitch_from_b = 0;
+
+    if (t->blend_mode == BM_MORPH) return (thr < w) ? 1 : 0;
+    if (t->blend_mode == BM_SPLIT) { *pitch_from_b = (thr < w); return 0; }
+
+    /* Logic modes: three-way source A / result / B. */
+    int src; /* 0 = A alone, 1 = logic result, 2 = B alone */
+    if (w < 0.5f) src = (thr < w * 2.0f) ? 1 : 0;
+    else          src = (thr < (w - 0.5f) * 2.0f) ? 2 : 1;
+    if (src == 0) return gate_a ? 0 : -1;
+    if (src == 2) return gate_b ? 1 : -1;
+    switch (t->blend_mode) {
+        case BM_FILL: return gate_a ? 0 : (gate_b ? 1 : -1);
+        case BM_XOR:  return (gate_a && !gate_b) ? 0 : ((gate_b && !gate_a) ? 1 : -1);
+        default:      return (gate_a && gate_b) ? 0 : -1; /* Lock */
+    }
+}
+
 static void recompute_step_length(acid_inst_t *t, int sample_rate) {
     double sixteenths_per_sec = (double)t->bpm / 60.0 * 4.0;
     if (sixteenths_per_sec <= 0) sixteenths_per_sec = 8.0;
@@ -615,7 +663,7 @@ static int kill_all_notes(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[],
  *     Mod Wheel is the CC a Force CV track's own CV-row assignment menu
  *     expects for a non-pitch/velocity/gate row (see docs/CC-MAP.md). The
  *     on/off semantics (127 on, 0 off) are otherwise unchanged. */
-static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int prev_pos, int vel_scale,
+static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int prev_pos, int vel_scale,
                               uint8_t out_msgs[][3], int out_lens[], int max_out) {
     acid_seq_t *s = &t->seq[seq_idx];
     int count = 0;
@@ -628,7 +676,10 @@ static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int prev_pos, int vel_
         return count;
     }
 
-    int note = note_for_step(s, t->scale, t->root, t->live_transpose, pidx);
+    /* pitch_seq == seq_idx except in Blend Mode Split, where pitch can come
+     * from the other sequencer while rhythm/slide/accent stay this one's. */
+    const acid_seq_t *ps = &t->seq[pitch_seq];
+    int note = note_for_step(ps, t->scale, t->root, t->live_transpose, play_idx(ps, ps->position));
     int is_accent = (kind == STEP_ACCENT);
     int vel;
     if (t->cv_mode) {
@@ -826,12 +877,10 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
         }
     }
 
-    int vel_a, vel_b;
-    compute_blend_velocities(t->blend, &vel_a, &vel_b);
-
+    int prev[NUM_SEQS];
     for (int i = 0; i < NUM_SEQS; i++) {
         acid_seq_t *s = &t->seq[i];
-        int prev = s->position;
+        prev[i] = s->position;
         if (forced_reset) {
             s->position = 0;
             s->pendulum_fwd = 1;  /* Reset Both is authoritative -- pendulum resumes forward */
@@ -848,7 +897,7 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
                 rng_next_f(&s->rng) < t->jitter) {
                 switch (rng_next_u32(&s->rng) % 3u) {
                     case 0: np = (np + 1) % s->length; break;
-                    case 1: np = prev; break;
+                    case 1: np = prev[i]; break;
                     default: {
                         int r = (int)(rng_next_f(&s->rng) * (float)s->length);
                         if (r >= s->length) r = s->length - 1;
@@ -858,9 +907,37 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
             }
             s->position = np;
         }
-        int vel_scale = (i == SEQ_A) ? vel_a : vel_b;
-        if (count < max_out) {
-            count += emit_step_for_seq(t, i, prev, vel_scale, &out_msgs[count], &out_lens[count], max_out - count);
+    }
+
+    if (t->blend_mode == BM_LAYER) {
+        int vel_a, vel_b;
+        compute_blend_velocities(t->blend, &vel_a, &vel_b);
+        for (int i = 0; i < NUM_SEQS; i++) {
+            int vel_scale = (i == SEQ_A) ? vel_a : vel_b;
+            if (count < max_out) {
+                count += emit_step_for_seq(t, i, i, prev[i], vel_scale, &out_msgs[count], &out_lens[count], max_out - count);
+            }
+        }
+        return count;
+    }
+
+    /* Both positions are settled, so Blend Mode can see both steps. */
+    int gate_a = t->seq[SEQ_A].steps[play_idx(&t->seq[SEQ_A], t->seq[SEQ_A].position)] != STEP_REST;
+    int gate_b = t->seq[SEQ_B].steps[play_idx(&t->seq[SEQ_B], t->seq[SEQ_B].position)] != STEP_REST;
+    int pitch_from_b;
+    int pick = blend_pick(t, gate_a, gate_b, &pitch_from_b);
+
+    /* Muted sequencer first, so its note-off can never land after (and cut)
+     * the audible sequencer's note-on when both share a pitch. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < NUM_SEQS; i++) {
+            int audible = (i == pick) || (t->blend_mode == BM_SPLIT && i == SEQ_A);
+            if ((pass == 0) == audible) continue;
+            int pitch_seq = (i == SEQ_A && pitch_from_b) ? SEQ_B : i;
+            if (count < max_out) {
+                count += emit_step_for_seq(t, i, pitch_seq, prev[i], audible ? 127 : 0,
+                                           &out_msgs[count], &out_lens[count], max_out - count);
+            }
         }
     }
     return count;
@@ -1221,6 +1298,8 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
         if (v < -63) v = -63;
         if (v > 64) v = 64;
         t->blend = v;
+    } else if (strcmp(key, "blend_mode") == 0) {
+        int v = parse_int(val, 0); if (v < 0 || v >= NUM_BLEND_MODES) v = 0; t->blend_mode = v;
     } else if (strcmp(key, "reset_bars") == 0) {
         int v = parse_int(val, 4); if (v < 0 || v > 4) v = 4;
         t->reset_bars_idx = v;
@@ -1281,6 +1360,7 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
     if (strcmp(key, "root") == 0) n = snprintf(buf, buf_len, "%d", t->root);
     else if (strcmp(key, "scale") == 0) n = snprintf(buf, buf_len, "%d", t->scale);
     else if (strcmp(key, "blend") == 0) n = snprintf(buf, buf_len, "%d", t->blend);
+    else if (strcmp(key, "blend_mode") == 0) n = snprintf(buf, buf_len, "%d", t->blend_mode);
     else if (strcmp(key, "reset_bars") == 0) n = snprintf(buf, buf_len, "%d", t->reset_bars_idx);
     else if (strcmp(key, "swing") == 0) n = snprintf(buf, buf_len, "%d", t->swing_pct);
     else if (strcmp(key, "jitter") == 0) n = snprintf(buf, buf_len, "%.3f", t->jitter);
@@ -1320,6 +1400,7 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
             "{\"key\":\"scale\",\"name\":\"Scale\",\"type\":\"enum\",\"options\":[\"Minor\",\"Phrygian\",\"HarmMinor\",\"MinPent\",\"Dorian\",\"Major\",\"PhrygDom\",\"Locrian\",\"WholeTone\",\"HungMinor\",\"MinBlues\",\"Chromatic\"],\"default\":0},"
             "{\"key\":\"root\",\"name\":\"Root\",\"type\":\"enum\",\"options\":[\"C\",\"C#\",\"D\",\"D#\",\"E\",\"F\",\"F#\",\"G\",\"G#\",\"A\",\"A#\",\"B\"],\"default\":9},"
             "{\"key\":\"b_tune\",\"name\":\"Tune B\",\"type\":\"int\",\"min\":-24,\"max\":24,\"step\":1,\"default\":0},"
+            "{\"key\":\"blend_mode\",\"name\":\"Blend Mode\",\"type\":\"enum\",\"options\":[\"Layer\",\"Morph\",\"Split\",\"Fill\",\"XOR\",\"Lock\"],\"default\":0},"
             "{\"key\":\"blend\",\"name\":\"Blend\",\"type\":\"int\",\"min\":-63,\"max\":64,\"step\":1,\"default\":-63},"
             "{\"key\":\"a_algo\",\"name\":\"Algo A\",\"type\":\"int\",\"min\":1,\"max\":16,\"step\":1,\"default\":1},"
             "{\"key\":\"b_algo\",\"name\":\"Algo B\",\"type\":\"int\",\"min\":1,\"max\":16,\"step\":1,\"default\":1},"
