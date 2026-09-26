@@ -1,7 +1,7 @@
 # Vendored: acid_core.c / acid_core.h
 
 Source: `sd88me/force-acid`, `src/acid_core.c` + `src/acid_core.h`
-Vendored at commit: `a7cf75f94cb274988e061f9e32bd58661e6c41dc` (2026-09-26)
+Vendored at commit: `e40708729fb9020a6469d46aaf0ee8153d72be73` (2026-09-26)
 License: GPLv3 (same author, same license as this repo — see `LICENSE`).
 
 This is the shared DSP/sequencer engine also used by the Force Shadow addon

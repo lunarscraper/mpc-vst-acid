@@ -38,7 +38,7 @@
     { "key": "reset_bars", "name": "Reset",      "options": ["1 BAR", "2 BARS", "4 BARS", "8 BARS", "OFF"] },
     { "key": "swing",      "name": "Swing",      "min": 50,  "max": 75 },
     { "key": "jitter",     "name": "Jitter",     "min": 0.0, "max": 1.0 },
-    { "key": "blend_mode", "name": "Blend Mode", "options": ["LAYER", "MORPH", "SPLIT", "FILL", "XOR", "LOCK"] },
+    { "key": "blend_mode", "name": "Blend Mode", "options": ["LAYER", "MORPH", "SPLIT", "FILL", "XOR", "LOCK", "CHAIN"] },
     { "key": "cv_mode",    "name": "CV Mode",    "options": ["OFF", "ON"] }
   ]
 }
