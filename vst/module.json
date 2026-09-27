@@ -13,7 +13,6 @@
     { "key": "a_offset",   "name": "Offset",   "min": 0,    "max": 31 },
     { "key": "a_dir",      "name": "Dir",      "options": ["FWD", "REV", "PENDUL"] },
     { "key": "a_auto_gen", "name": "Regen",    "options": ["OFF", "1 BAR", "2 BARS", "4 BARS", "8 BARS", "16 BARS", "32 BARS"] },
-    { "key": "a_dump",     "name": "Export",   "access": "write" },
 
     { "key": "b_generate", "name": "Generate", "access": "write" },
     { "key": "b_mutate",   "name": "Mutate",   "access": "write" },
@@ -27,7 +26,6 @@
     { "key": "b_offset",   "name": "Offset",   "min": 0,    "max": 31 },
     { "key": "b_dir",      "name": "Dir",      "options": ["FWD", "REV", "PENDUL"] },
     { "key": "b_auto_gen", "name": "Regen",    "options": ["OFF", "1 BAR", "2 BARS", "4 BARS", "8 BARS", "16 BARS", "32 BARS"] },
-    { "key": "b_dump",     "name": "Export",   "access": "write" },
 
     { "key": "scale",      "name": "Scale",      "options": ["MINOR", "PHRYGIAN", "HARM MIN", "MIN PENT", "DORIAN", "MAJOR", "PHRYG DOM", "LOCRIAN", "WHOLE TONE", "HUNG MIN", "MIN BLUES", "CHROMATIC"] },
     { "key": "root",       "name": "Root",       "options": ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] },

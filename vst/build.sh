@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build Force Acid as a VST2 plugin for the MPC OS plugin host (armhf).
-#   vst/build/force_acid.so         -> /sdcard/vst/ on the device
+# Build Acid as a VST2 plugin for the MPC OS plugin host (armhf).
+#   vst/build/acid.so         -> /sdcard/vst/ on the device
 #   vst/build/pluginlist-entry.xml  the <PLUGIN> line for MPC.settings' pluginList-arm
 #   vst/build/skin/                 -> /sdcard/Synths/ on the device
 # vst.json/module.json only feed mpc-vst-plugins' tools/gen_vst.py for params.h + the
@@ -43,12 +43,12 @@ docker run --rm --platform linux/arm/v7 -v "$PWD/..":/b -w /b/vst arm32v7/gcc:12
   gcc -O2 -fPIC -fvisibility=hidden -std=gnu11 -I../src -c ../src/acid_core.c -o build/obj/core.o
   g++ -O2 -fPIC -fvisibility=hidden -std=c++17 -Wall -Wextra -Wno-unused-parameter \
       -I../src -Ibuild -c acid_vst.cpp -o build/obj/vst.o
-  g++ -shared -o build/force_acid.so build/obj/core.o build/obj/vst.o \
+  g++ -shared -o build/acid.so build/obj/core.o build/obj/vst.o \
       -static-libstdc++ -static-libgcc -lasound -lpthread -lm
-  strip build/force_acid.so
-  echo "-- exported --"; readelf --dyn-syms -W build/force_acid.so | grep -E " GLOBAL .* [0-9]+ [A-Za-z]" | grep -v UND
-  echo "-- needed --"; readelf -d build/force_acid.so | grep NEEDED
-  echo "-- highest glibc (device has 2.39) --"; readelf -V build/force_acid.so | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1
+  strip build/acid.so
+  echo "-- exported --"; readelf --dyn-syms -W build/acid.so | grep -E " GLOBAL .* [0-9]+ [A-Za-z]" | grep -v UND
+  echo "-- needed --"; readelf -d build/acid.so | grep NEEDED
+  echo "-- highest glibc (device has 2.39) --"; readelf -V build/acid.so | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1
   chown -R '"$U"' build
 '
-md5sum build/force_acid.so
+md5sum build/acid.so

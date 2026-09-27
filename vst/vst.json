@@ -1,9 +1,9 @@
 {
-  "name": "Force Acid",
+  "name": "Acid",
   "vendor": "sd88me",
   "uid": "AcId",
   "version": 1000,
-  "so": "force_acid.so",
+  "so": "acid.so",
   "module": "module.json",
   "layout": "layout.conf",
   "title_font": "fonts/Earth_Normal.ttf",

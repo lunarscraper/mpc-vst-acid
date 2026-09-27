@@ -1,6 +1,6 @@
 # mpc-vst-acid
 
-Force Acid (dual generative acid-bassline sequencer) ported as a native VST2
+Acid (dual generative acid-bassline sequencer) ported as a native VST2
 plugin for the Akai MPC OS built-in JUCE plugin host (Force, MPC Live/One/X/Key).
 
 Sibling of the Force Shadow addon in `sd88me/force-acid` — same generation
@@ -18,7 +18,7 @@ set `MPC_VST=/path/to/mpc-vst`) for the shared skin-rendering tools.
 ```
 vst/build.sh
 ```
-Docker-based; produces `vst/build/force_acid.so` (armhf), the skin folder,
+Docker-based; produces `vst/build/acid.so` (armhf), the skin folder,
 and `pluginlist-entry.xml`. Requires `../mpc-vst` checked out next to this
 repo (or `MPC_VST=...`).
 

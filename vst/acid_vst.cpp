@@ -1,5 +1,5 @@
 /* =============================================================================
- * acid_vst.cpp - Force Acid as a VST2 MIDI generator for the MPC OS plugin host
+ * acid_vst.cpp - Acid as a VST2 MIDI generator for the MPC OS plugin host
  * (see https://github.com/sd88me/mpc-vst-plugins). Links src/acid_core.c
  * directly, the same generator src/host_shim.cpp drives on MockbaMod, and
  * plays the same "chain host" role host_shim.cpp plays there -- but inside
@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 
@@ -102,14 +103,51 @@ struct Plugin {
     audioMasterCallback master;
     void *inst = nullptr;
     std::mutex lock;               /* serialises every call into the core */
-    volatile char release[NPARAMS] = {0};
+    volatile int release[NPARAMS] = {0};
+    bool held[NPARAMS] = {false};  /* momentary params: host currently reports them pressed */
     float open[NPARAMS] = {0};     /* popup "open" flags (popup.h): wrapper-only, not saved */
     double last_ppq = 0.0;
     bool was_playing = false;
     snd_seq_t *seq = nullptr;
     int seq_port = -1;
     char chunk[2048] = {0};
+    /* diagnostics: per-callback timing, logged periodically and on slow callbacks */
+    double t_max = 0, t_sum = 0, t_last_log = 0;
+    long blocks = 0, slow = 0;
+    int32_t block_min = 1 << 30, block_max = 0;
+    /* loop guard: MPC record-arm/input-monitor can route this plugin's own
+       ALSA output straight back in as VstMidiEvents (effProcessEvents), and
+       the core's "pass everything else through" branch echoes it straight
+       back out -- a self-sustaining feedback loop, audio-thread only so no
+       lock needed. Remember the last few bytes we actually sent and drop an
+       incoming event that matches one, once, instead of re-feeding it. */
+    uint8_t sent_ring[16][3] = {{0}};
+    int sent_len = 0, sent_pos = 0;
 };
+static bool was_just_sent(Plugin *w, const uint8_t *m) {
+    /* Match on status+data1 only, NOT velocity (data2): verified 2026-09-27
+     * that MPC's record-arm loopback doesn't return our own output byte-exact
+     * -- velocity gets quantized in transit (e.g. sent 72 comes back as 71,
+     * a note-off's velocity 0 comes back as 64), so an exact 3-byte compare
+     * missed most echoes and let them fall through as "real" transpose
+     * input, continuously re-transposing the live pattern off its own
+     * output. A genuine human keypress landing on the exact same note
+     * number as the sequencer's own output, in the very same instant, isn't
+     * a realistic collision to worry about. */
+    for (int i = 0; i < w->sent_len; i++) {
+        int idx = (w->sent_pos - 1 - i + 16) % 16;
+        if (w->sent_ring[idx][0] == m[0] && w->sent_ring[idx][1] == m[1]) {
+            w->sent_ring[idx][0] = 0xFF;   /* consume: don't match it again */
+            return true;
+        }
+    }
+    return false;
+}
+static double now_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
@@ -136,6 +174,7 @@ static float get_norm(Plugin *w, int i) {
     char buf[64];
     int n;
     if (popup_is(i)) return w->open[i];
+    if (PARAMS[i].momentary) return 0.0f;   /* triggers always read released, or the host echoes the press back */
     { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
     return n > 0 ? str_to_norm(&PARAMS[i], buf) : PARAMS[i].def;
 }
@@ -144,14 +183,15 @@ static float get_norm(Plugin *w, int i) {
  * ALSA seq output -- MPC OS ignores a plugin's VST MIDI output (mpc-vst-plugins
  * docs/NOTES.md), so notes go out a real ALSA sequencer port instead, exactly
  * as poc/midiport.c verified. MPC hot-detects the port with no restart; the
- * user routes a track's MIDI input from it, one per Force Acid instance.
+ * user routes a track's MIDI input from it, one per Acid instance.
  * ------------------------------------------------------------------------- */
 static void alsa_open(Plugin *w) {
-    if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0) { w->seq = nullptr; return; }
+    if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_OUTPUT, SND_SEQ_NONBLOCK) < 0) { w->seq = nullptr; return; }
+    snd_seq_set_client_pool_output(w->seq, 2048);   /* headroom so a slow subscriber never stalls the audio thread */
     int n = g_instance_count.fetch_add(1);
     char name[32];
-    if (n == 0) std::snprintf(name, sizeof name, "Force Acid");
-    else std::snprintf(name, sizeof name, "Force Acid %d", n + 1);
+    if (n == 0) std::snprintf(name, sizeof name, "Acid");
+    else std::snprintf(name, sizeof name, "Acid %d", n + 1);
     snd_seq_set_client_name(w->seq, name);
     w->seq_port = snd_seq_create_simple_port(w->seq, "MIDI Out",
         SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
@@ -159,6 +199,14 @@ static void alsa_open(Plugin *w) {
     LOG("[acid_vst] ALSA client '%s' port %d\n", name, w->seq_port);
 }
 static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int n) {
+    for (int i = 0; i < n; i++) {
+        if (lens[i] < 2) continue;
+        w->sent_ring[w->sent_pos][0] = msgs[i][0];
+        w->sent_ring[w->sent_pos][1] = msgs[i][1];
+        w->sent_ring[w->sent_pos][2] = lens[i] > 2 ? msgs[i][2] : 0;
+        w->sent_pos = (w->sent_pos + 1) % 16;
+        if (w->sent_len < 16) w->sent_len++;
+    }
     if (!w->seq || w->seq_port < 0) return;
     for (int i = 0; i < n; i++) {
         const uint8_t *m = msgs[i];
@@ -174,8 +222,9 @@ static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int 
         else if (type == 0x80 || (type == 0x90 && len >= 3)) snd_seq_ev_set_noteoff(&ev, ch, m[1], 0);
         else if (type == 0xB0 && len >= 3) snd_seq_ev_set_controller(&ev, ch, m[1], m[2]);
         else continue;
-        snd_seq_event_output_direct(w->seq, &ev);
+        snd_seq_event_output(w->seq, &ev);   /* buffered, non-blocking: drops instead of hanging */
     }
+    snd_seq_drain_output(w->seq);
 }
 static void alsa_close(Plugin *w) {
     if (!w->seq) return;
@@ -227,7 +276,7 @@ static void feed_transport(Plugin *w, int32_t frames) {
     if (playing && ti) {
         const double step = 1.0 / 24.0;   /* 24 PPQN, in quarter notes */
         double start = w->last_ppq, end = ti->ppqPos;
-        if (end < start) start = end;     /* loop/rewind: resync, don't flood pulses */
+        if (end < start || end - start > 1.0) start = end;   /* loop/rewind/jump: resync, don't flood pulses */
         double next = std::ceil(start / step) * step;
         for (; next < end + 1e-9; next += step) {
             msg[0] = 0xF8;
@@ -249,10 +298,26 @@ static void feed_transport(Plugin *w, int32_t frames) {
 static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     (void)in;
     Plugin *w = (Plugin *)e->object;
+    double t0 = now_ms();
     feed_transport(w, n);
     for (int i = 0; i < NPARAMS; i++)
-        if (w->release[i]) { w->release[i] = 0; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
+        if (w->release[i]) { w->release[i] = 0; w->held[i] = false; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
     for (int32_t i = 0; i < n; i++) out[0][i] = out[1][i] = 0.0f;   /* MIDI generator: no audio */
+
+    double t1 = now_ms(), dt = t1 - t0;
+    w->blocks++; w->t_sum += dt;
+    if (dt > w->t_max) w->t_max = dt;
+    if (n < w->block_min) w->block_min = n;
+    if (n > w->block_max) w->block_max = n;
+    if (dt > 2.0) { w->slow++; LOG("[acid_vst] SLOW callback %.2f ms (block %d, ppq %.3f)\n", dt, n, w->last_ppq); }
+    if (t1 - w->t_last_log > 5000.0) {
+        if (w->t_last_log > 0)
+            LOG("[acid_vst] %ld blocks, size %d..%d, avg %.3f ms, max %.2f ms, slow %ld, playing %d, ppq %.3f, bpm %.1f\n",
+                w->blocks, w->block_min, w->block_max, w->t_sum / w->blocks, w->t_max, w->slow,
+                (int)w->was_playing, w->last_ppq, g_bpm.load());
+        w->t_last_log = t1; w->t_max = w->t_sum = 0; w->blocks = w->slow = 0;
+        w->block_min = 1 << 30; w->block_max = 0;
+    }
 }
 
 static void setParameter(AEffect *e, int32_t i, float n) {
@@ -261,7 +326,10 @@ static void setParameter(AEffect *e, int32_t i, float n) {
     const param_t *p = &PARAMS[i];
     if (popup_set(w->open, i, n)) return;
     if (p->momentary) {
-        if (n > 0.5f) {
+        bool down = n > 0.5f;
+        bool rising = down && !w->held[i];   /* an echo of our own automate must not re-fire the trigger */
+        w->held[i] = down;
+        if (rising) {
             std::lock_guard<std::mutex> lk(w->lock);
             g_api->set_param(w->inst, p->key, "go");
             w->release[i] = 1;
@@ -344,6 +412,21 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         for (int i = 0; i < ev->numEvents; i++) {
             if (ev->events[i]->type != 1) continue;
             VstMidiEvent *m = (VstMidiEvent *)ev->events[i];
+            /* MPC's record-arm input monitor loops this plugin's own ALSA
+             * output straight back in as VstMidiEvents -- for note-on/off
+             * that's not just a no-op echo (the core always swallows note
+             * in/out, never re-emits it): it silently re-sets live_transpose
+             * from whatever pitch the echoed note carries, permanently
+             * detuning the live pattern (verified 2026-09-27). Channel-based
+             * filtering (treat any note on a_channel/b_channel as always our
+             * own) is too broad -- the user's real transpose input arrives
+             * on that same channel (both default to 1), so it silently ate
+             * every real transpose press too. Byte-exact match against what
+             * Acid actually just sent is the correct discriminator: an echo
+             * of our own output matches status+note+velocity exactly, while
+             * a human keypress almost never lands on Acid's own fixed
+             * generator velocities (72/118 normal, 1/127 CV mode). */
+            if (was_just_sent(w, m->midiData)) continue;
             int n;
             { std::lock_guard<std::mutex> lk(w->lock);
               n = g_api->process_midi(w->inst, m->midiData, 3, out, olen, MIDI_FX_MAX_OUT_MSGS); }
@@ -388,7 +471,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
 }
 
 extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMasterCallback master) {
-    if (!g_log) g_log = std::fopen("/tmp/force_acid_vst.log", "a");
+    if (!g_log) g_log = std::fopen("/tmp/acid_vst.log", "a");
     {
         std::lock_guard<std::mutex> lk(g_api_init_lock);
         if (!g_api) {
