@@ -1,0 +1,19 @@
+/* Acid skin studio: look. Panel text matches mpc-jv880 (Univers 53 Extended, real silkscreen
+ * sans) -- see docs/SKIN_STUDIO.md's font-picker note ("fonts only change baked text"). The
+ * top-bar wordmark uses Earth Normal instead: a fun, rounded, bubble-ish weight standing in for
+ * a proper 90s acid-house rave logo font, kept off every other label so the panel stays legible. */
+@font-face { font-family: "Univers 53 Extended"; src: url("fonts/Univers_53_Extended_Regular.otf"); }
+@font-face { font-family: "Earth Normal"; src: url("fonts/Earth_Normal.ttf"); }
+
+:root {
+  --font: "Univers 53 Extended", "Titillium Web", "DejaVu Sans", sans-serif;
+  --title-font: var(--font);
+  --acid-logo-font: "Earth Normal", "Titillium Web", sans-serif;
+  --sheen: 0.15;
+}
+
+.frame-title, .td3 .frame-title { fill: var(--ink); }
+.knob-pointer { stroke: var(--ink); }
+
+/* the acid_top.svg banner (title wordmark + smiley) sits on the panel colour, no extra chrome */
+.acid-wordmark { font-family: var(--acid-logo-font); }

@@ -14,25 +14,13 @@ MPC_VST="${MPC_VST:-../../mpc-vst}"
 U="$(id -u):$(id -g)"
 mkdir -p build
 
-# 1. skin artwork renderer (host binary; mpc-vst's vendored copy of the renderer, tools/vendor/force-shadow)
-docker run --rm -u "$U" -v "$PWD":/w -v "$MPC_VST":/mv:ro -w /w gcc:12 \
-  gcc -O2 -I/mv/tools/vendor/force-shadow/tools -o build/shadow_art /mv/tools/shadow_art.c -lm
+# 1. skin artwork renderer: the browser one (vst.json "art": "html" -- docs/SKIN_STUDIO.md),
+# so skin.css/@font-face and images/acid_top.svg's inline SVG can be used for the redone skin.
+docker build -q -t mpc-vst-html-art "$MPC_VST/tools/html_art" >/dev/null
 
-# 2. params.h, skin, pluginlist-entry.xml (needs Pillow, for the offline skin preview and the
-# real-font title overlay below). TITLE_FONT (vst.json's "title_font"): mirrors build_port.sh's
-# own handling verbatim (shadow_skin.py's SHADOW_TITLE_FONT env var draws frame titles with a
-# real font as a Pillow overlay after shadow_art bakes the background, instead of its baked
-# bitmap font -- see docs/NOTES.md's font entry). font_label= (Earth, panel/button text) is a
-# layout.conf key instead, rendered in C by shadow_art itself (render_conf_preview.c).
-TITLE_FONT=$(python3 -c "import json; print(json.load(open('vst.json')).get('title_font',''))")
-FONT_MOUNT=()
-FONT_ENV=()
-if [ -n "$TITLE_FONT" ]; then
-  FONT_MOUNT=(-v "$PWD/$TITLE_FONT:/w/$TITLE_FONT:ro")
-  FONT_ENV=(-e "SHADOW_TITLE_FONT=/w/$TITLE_FONT")
-fi
-docker run --rm -u "$U" -v "$PWD":/w -v "$MPC_VST":/mv:ro "${FONT_MOUNT[@]}" "${FONT_ENV[@]}" -w /w python:3.11-slim sh -c \
-  "pip install -q --no-warn-script-location --target /tmp/p pillow >/dev/null 2>&1; PYTHONPATH=/tmp/p python3 /mv/tools/gen_vst.py vst.json"
+# 2. params.h, skin, pluginlist-entry.xml
+docker run --rm -u "$U" -e HOME=/tmp -v "$PWD":/w -v "$MPC_VST":/mv:ro -w /w mpc-vst-html-art \
+  python3 /mv/tools/gen_vst.py vst.json
 
 cp "$MPC_VST/wrapper/popup.h" build/   # popup open-flag handling shared with mpc-vst's own wrapper
 

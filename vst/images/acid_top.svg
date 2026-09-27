@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1208 112">
+  <!-- classic acid-house smiley, faded into the background as a watermark -->
+  <g opacity="0.14">
+    <circle cx="1010" cy="56" r="92" fill="var(--accent-hi)"/>
+    <ellipse cx="975" cy="40" rx="10" ry="14" fill="var(--line)"/>
+    <ellipse cx="1045" cy="40" rx="10" ry="14" fill="var(--line)"/>
+    <path d="M 955 68 Q 1010 118 1065 68" stroke="var(--line)" stroke-width="10" fill="none" stroke-linecap="round"/>
+  </g>
+  <!-- ACID wordmark, 90s rave-logo font -->
+  <text x="60" y="84" class="acid-wordmark" font-size="72" fill="var(--accent-hi)"
+        stroke="var(--line)" stroke-width="2" letter-spacing="4">ACID</text>
+  <!-- a crisp little smiley riding next to the wordmark -->
+  <g>
+    <circle cx="330" cy="56" r="34" fill="var(--accent-hi)" stroke="var(--line)" stroke-width="4"/>
+    <ellipse cx="317" cy="46" rx="5" ry="7" fill="var(--line)"/>
+    <ellipse cx="343" cy="46" rx="5" ry="7" fill="var(--line)"/>
+    <path d="M 308 64 Q 330 84 352 64" stroke="var(--line)" stroke-width="6" fill="none" stroke-linecap="round"/>
+  </g>
+</svg>

@@ -6,6 +6,6 @@
   "so": "acid.so",
   "module": "module.json",
   "layout": "layout.conf",
-  "title_font": "fonts/Earth_Normal.ttf",
+  "art": "html",
   "_comment": "Not a Schwung DSP quick-start port (MIDI generator, no chain host on the Force): vst.json/module.json here only feed tools/gen_vst.py for params.h + the skin. The actual plugin is acid_vst.cpp, built by this port's own build.sh (links acid_core.c directly, ALSA seq output -- see docs/PORTING.md classification 0)."
 }
