@@ -1,0 +1,35 @@
+# Build Acid into a DRAFT release (acid-vst-v<version>) with mpc-vst-plugins' shared workflow:
+# Actions -> "VST release (draft)" -> Run workflow. Then install that draft's zip on a device,
+# smoke-test it, and publish the draft (see mpc-vst-plugins docs/RELEASING.md).
+# dry_run builds the zip and skin previews as run artifacts only.
+#
+# tools_ref is pinned to a commit on mpc-vst-plugins' claude/verify-native-components branch,
+# not master: that's the commit with the label_scale= layout key this skin depends on
+# (docs/SKIN_STUDIO.md). Bump it once that lands on master.
+name: VST release (draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, e.g. 1.0.0
+        required: true
+      dry_run:
+        description: Build only (zip + skin previews as run artifacts), no draft release
+        type: boolean
+        default: false
+
+jobs:
+  acid:
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@2d229a29efc032936bfa02a5d948e96cfa7899a6
+    permissions:
+      contents: write
+    with:
+      tag: acid-vst-v${{ inputs.version }}
+      version: ${{ inputs.version }}
+      tools_ref: 2d229a29efc032936bfa02a5d948e96cfa7899a6
+      vst_dir: vst
+      build: vst/build.sh
+      host_test: vst/test.sh
+      about: A TB-303-style acid bassline sequencer (two lines, blendable) that drives a synth track over MIDI.
+      dry_run: ${{ inputs.dry_run }}
