@@ -1,6 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1208 112">
   <defs>
-    <!-- classic acid-house smiley, redone drippy/melted and tilted, happy (not angled/angry) eyes.
+    <!-- classic acid-house smiley: plain round dot eyes and a thin line mouth (the basic 90s
+         rave-flyer version, not a slanted/closed-eye emoji), drippy/melted at the bottom, tilted.
          Unit size ~R=40 at the origin; instances below scale it up (background watermark) and
          down (the crisp emblem next to the wordmark). -->
     <g id="acid-smiley">
@@ -9,9 +10,9 @@
         <path d="M 0 40 C -8 48 -8 58 0 66 C 8 58 8 48 0 40 Z" fill="var(--accent-hi)"/>
         <path d="M 22 33 C 16 39 16 45 22 49 C 28 45 28 39 22 33 Z" fill="var(--accent-hi)"/>
         <circle cx="0" cy="0" r="40" fill="var(--accent-hi)" stroke="var(--line)" stroke-width="4"/>
-        <path d="M -22 -7 Q -16 -17 -10 -7" fill="none" stroke="var(--line)" stroke-width="5" stroke-linecap="round"/>
-        <path d="M 10 -7 Q 16 -17 22 -7" fill="none" stroke="var(--line)" stroke-width="5" stroke-linecap="round"/>
-        <path d="M -19 10 Q 0 28 21 6" fill="none" stroke="var(--line)" stroke-width="6" stroke-linecap="round"/>
+        <circle cx="-16" cy="-9" r="6" fill="var(--line)"/>
+        <circle cx="16" cy="-9" r="6" fill="var(--line)"/>
+        <path d="M -19 8 Q 0 24 19 8" fill="none" stroke="var(--line)" stroke-width="3" stroke-linecap="round"/>
       </g>
     </g>
   </defs>
