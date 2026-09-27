@@ -397,8 +397,13 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
             int n;
             { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, pp->key, buf, sizeof buf); }
             if (n > 0) {
+                /* always show a whole number: a small physical range (density/accent/slide/gate/
+                 * jitter, 0..1-ish) reads as its 0-100 percentage instead of a raw decimal; a wide
+                 * range (channel, algo, octaves, length, offset, swing, ...) just rounds. */
+                float raw = (float)std::atof(buf), range = pp->max - pp->min;
+                long show = std::lround(range > 0 && range <= 2.0f ? (raw - pp->min) / range * 100.0f : raw);
                 char disp[32];
-                std::snprintf(disp, sizeof disp, "%.*f", std::fabs(pp->max - pp->min) > 20 ? 0 : 2, std::atof(buf));
+                std::snprintf(disp, sizeof disp, "%ld", show);
                 copy_str(p, disp, 24);
             }
         }
