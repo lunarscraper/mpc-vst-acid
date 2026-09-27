@@ -15,5 +15,11 @@
 .frame-title, .td3 .frame-title { fill: var(--ink); }
 .knob-pointer { stroke: var(--ink); }
 
+/* trigger buttons (GENERATE/MUTATE): flat black keycap with a yellow rule, TB-303 style,
+   instead of the default glossy red rounded pill */
+.button-bg { fill: #141311; stroke: var(--accent-hi); stroke-width: 2; rx: 4; filter: none; }
+.button-sheen { opacity: 0.04; rx: 4; }
+.button-tx, .td3 .button-tx { fill: var(--accent-hi); font-weight: 700; }
+
 /* the acid_top.svg banner (title wordmark + smiley) sits on the panel colour, no extra chrome */
 .acid-wordmark { font-family: var(--acid-logo-font); }
