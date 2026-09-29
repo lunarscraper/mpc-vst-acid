@@ -4,24 +4,9 @@ A TB-303-style acid bassline sequencer for the Akai MPC OS built-in plugin host.
 bass lines, lets you blend between them, and plays them over MIDI into a synth track. Acid makes
 no sound itself. It is a native VST2 plugin with a touchscreen skin and Q-Link control.
 
+<img width="640" height="400" alt="2026-09-29T124456312Z" src="https://github.com/user-attachments/assets/a9bac6d3-8b13-4715-95be-18ebab731cce" />
+
 **Version 1.0.0** · GPL-3.0-only · by sd88me
-
-## What you need
-- A first-generation MPC OS standalone device (32-bit ARM): Force, MPC Live / Live II, One, X or Key 61.
-  Tested on a Force. Newer models are untested.
-- **Root SSH access** to the device. Stock MPC OS doesn't offer it, so this is for modded units.
-- Installing plugins this way is unofficial. Back up first and use it at your own risk.
-
-## Install
-1. Download `Acid-<version>-mpc-armv7.zip` from the
-   [Releases page](https://github.com/sd88me/mpc-vst-acid/releases) and unzip it.
-2. Copy the folder to the device: `scp -r Acid-1.0.0 root@<device-ip>:/tmp/`
-3. Run the installer: `ssh root@<device-ip> sh /tmp/Acid-1.0.0/install.sh`
-
-The installer **stops MPC** (save your project first), copies the plugin and skin, backs up
-`MPC.settings`, registers the plugin and restarts MPC. Run it again to upgrade in place. Add `-y` to skip
-the confirmation. `uninstall.sh` in the same folder removes it. `INSTALL.md` in the zip covers
-installing by hand.
 
 ## Use it
 1. Add **Acid** to an instrument track from the plugin browser.
@@ -82,6 +67,24 @@ repeatable rather than random.
 | CHAIN | Call and response: A plays a full pass, then B answers with a full pass | Sets the pass ratio. Centre is one pass each, and the ends give one side up to 8:1 |
 
 Settings are saved with your project.
+
+## What you need
+- A first-generation MPC OS standalone device (32-bit ARM): Force, MPC Live / Live II, One, X or Key 61.
+  Tested on a Force. Newer models are untested.
+- **Root SSH access** to the device. Stock MPC OS doesn't offer it, so this is for modded units.
+- Installing plugins this way is unofficial. Back up first and use it at your own risk.
+
+## Install
+1. Download `Acid-<version>-mpc-armv7.zip` from the
+   [Releases page](https://github.com/sd88me/mpc-vst-acid/releases) and unzip it.
+2. Copy the folder to the device: `scp -r Acid-1.0.0 root@<device-ip>:/tmp/`
+3. Run the installer: `ssh root@<device-ip> sh /tmp/Acid-1.0.0/install.sh`
+
+The installer **stops MPC** (save your project first), copies the plugin and skin, backs up
+`MPC.settings`, registers the plugin and restarts MPC. Run it again to upgrade in place. Add `-y` to skip
+the confirmation. `uninstall.sh` in the same folder removes it. `INSTALL.md` in the zip covers
+installing by hand.
+
 
 ## Building from source
 ```
