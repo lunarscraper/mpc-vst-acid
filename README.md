@@ -46,7 +46,7 @@ on both pages.
 | ALGO | 1 is the classic density/accent/slide model. Higher values blend in a second generator (non-repeating pitches, random-walk density, pyramid accents), up to 16 |
 | LENGTH | Steps before the pattern loops, 2 to 32. It takes effect at once. GENERATE to fill a longer pattern with new steps |
 | GATE | Note length as a fraction of a step. It is live, and held slides ignore it |
-| OFFSET (A) / TUNE (B) | OFFSET rotates which step plays without rewriting the pattern. TUNE sets B's interval relative to A, ±24 semitones (+7 is a fifth above, -12 an octave below) |
+| OFFSET (A) / TUNE OFFSET (B) | OFFSET rotates which step plays without rewriting the pattern. TUNE OFFSET sets B's interval relative to A, ±24 semitones (+7 is a fifth above, -12 an octave below) |
 | DIR | Forward, reverse, or pendulum (bounces off each end) |
 | REGEN | Re-roll automatically every 1 to 32 bars, or off |
 | MIDI CH | MIDI channel the line plays on |
