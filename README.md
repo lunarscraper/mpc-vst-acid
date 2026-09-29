@@ -32,31 +32,54 @@ installing by hand.
 The screen has three pages, and the Q-Links follow the page you are on.
 
 ### SEQ A and SEQ B
-Each line is a separate sequencer with the same controls.
+Each line is an independent sequencer of 2 to 32 steps. Both free-run from the MPC transport. The controls are the same
+on both pages.
 
 | Control | What it does |
 |---|---|
-| GENERATE / MUTATE | Make a new pattern, or vary the current one |
-| DENSITY, ACCENT, SLIDE | How many steps play, and how many are accented or slid |
-| OCTAVES | Note range of the pattern, 1 to 3 octaves |
-| ALGO | Generation algorithm, 1 to 16 |
-| LENGTH | Pattern length, 2 to 32 steps |
-| GATE | Note length |
-| OFFSET (A) / TUNE (B) | Start the pattern that many steps in on A. Transpose B by ±24 semitones |
-| DIR | Forward, reverse or pendulum playback |
-| REGEN | Regenerate automatically every 1 to 32 bars, or off |
+| GENERATE | Re-roll the whole pattern from a new random seed. DENSITY, ACCENT, SLIDE, OCTAVES and ALGO are read at this moment, so they shape the *next* pattern, not the one playing |
+| MUTATE | Nudge about 25% of the steps in place (rest/note, pitch), keeping the pattern recognisable. Repeat it to keep evolving |
+| DENSITY | Chance that a step is a note rather than a rest |
+| ACCENT | Chance that a note is accented (louder) |
+| SLIDE | Chance that a note slides into the next step, 303-style. A slide into a rest becomes a plain note |
+| OCTAVES | How many octaves above the root the pitches can span, 1 to 3 |
+| ALGO | 1 is the classic density/accent/slide model. Higher values blend in a second generator (non-repeating pitches, random-walk density, pyramid accents), up to 16 |
+| LENGTH | Steps before the pattern loops, 2 to 32. It takes effect at once. GENERATE to fill a longer pattern with new steps |
+| GATE | Note length as a fraction of a step. It is live, and held slides ignore it |
+| OFFSET (A) / TUNE (B) | OFFSET rotates which step plays without rewriting the pattern. TUNE sets B's interval relative to A, ±24 semitones (+7 is a fifth above, -12 an octave below) |
+| DIR | Forward, reverse, or pendulum (bounces off each end) |
+| REGEN | Re-roll automatically every 1 to 32 bars, or off |
 | MIDI CH | MIDI channel the line plays on |
-| BLEND A>B | The blend between the two lines, shared with the GLOBAL page |
+| BLEND A>B | The same control as on GLOBAL |
+
+DENSITY, ACCENT, SLIDE and OCTAVES only affect the next GENERATE or MUTATE.
 
 ### GLOBAL
 | Control | What it does |
 |---|---|
-| SCALE, ROOT | Scale (12 choices, minor to chromatic) and root note used when generating |
-| SWING, JITTER | Timing feel: swing 50 to 75%, and random timing variation |
-| RESET ALL | Restart both patterns every 1, 2, 4 or 8 bars, or never |
-| BLEND MODE | How A and B combine: LAYER, MORPH, SPLIT, FILL, XOR, LOCK or CHAIN |
-| BLEND A>B | Position of the blend between the two lines |
+| SCALE | Scale both lines quantise to: Minor, Phrygian, Harmonic Minor, Minor Pentatonic, Dorian, Major, Phrygian Dominant, Locrian, Whole Tone, Hungarian Minor, Minor Blues or Chromatic (no scale) |
+| ROOT | The key both lines play in, C to B |
+| SWING | 16th-note swing from 50% (straight) to 75%, shared so the lines stay locked |
+| JITTER | Chance per step of perturbing which step plays, never when: skip a step, repeat the last one, or jump to a random one. 0 is off |
+| RESET ALL | Every 1, 2, 4 or 8 bars, snap both patterns back to step 1 together. Off lets patterns of different lengths drift as a polymeter |
+| BLEND MODE | How A and B merge into one mono line, decided step by step (see below) |
+| BLEND A>B | Sweeps from A to B, from -63 (A only) to +64 (B). How it acts depends on BLEND MODE |
 | CV MODE | Sends both lines to a Force CV track for external CV/Gate hardware instead of a MIDI synth |
+
+### Blend modes
+Except in LAYER, A and B are merged into one mono line, so a synth on a single track plays one note at a time. The
+other line is muted on each step, so notes never overlap. BLEND A>B sweeps in a fixed, evenly spread order, so the hand-over is
+repeatable rather than random.
+
+| Mode | Result | BLEND A>B |
+|---|---|---|
+| LAYER | Both lines play together as two voices, crossfaded by velocity. It is the only mode that isn't a single mono line | Fades the velocity from A to B |
+| MORPH | Each step comes from A or B | -63 is A only, +64 is B only |
+| SPLIT | Rhythm, slide and accent from A, pitch from B | -63 is A only, +64 is all pitches from B |
+| FILL | A plays, and B fills A's rests | -63 is A alone, centre is the fill result, +64 is B alone |
+| XOR | Plays only where exactly one line has a note: interlocking, syncopated | Same sweep as FILL |
+| LOCK | Plays only where both lines have a note: sparse and tight | Same sweep as FILL |
+| CHAIN | Call and response: A plays a full pass, then B answers with a full pass | Sets the pass ratio. Centre is one pass each, and the ends give one side up to 8:1 |
 
 Settings are saved with your project.
 
