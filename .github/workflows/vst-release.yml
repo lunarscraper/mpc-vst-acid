@@ -31,5 +31,7 @@ jobs:
       vst_dir: vst
       build: vst/build.sh
       host_test: vst/test.sh
+      plugin_id: acid
+      license: GPL-3.0-only
       about: A TB-303-style acid bassline sequencer (two lines, blendable) that drives a synth track over MIDI.
       dry_run: ${{ inputs.dry_run }}
