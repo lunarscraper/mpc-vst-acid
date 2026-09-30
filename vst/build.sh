@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Build Acid as a VST2 plugin for the MPC OS plugin host (armhf).
-#   vst/build/acid.so         -> /sdcard/vst/ on the device
+#   vst/build/acid.so, vst/build/skin/  packaged together as ONE plugin folder in /sdcard/Synths (tools/release.py)
 #   vst/build/pluginlist-entry.xml  the <PLUGIN> line for MPC.settings' pluginList-arm
-#   vst/build/skin/                 -> /sdcard/Synths/ on the device
 # vst.json/module.json only feed mpc-vst-plugins' tools/gen_vst.py for params.h + the
 # skin (this isn't a Schwung DSP quick-start port -- see docs/PORTING.md classification
 # 0, "MIDI generator"): the plugin itself is acid_vst.cpp, which links acid_core.c
