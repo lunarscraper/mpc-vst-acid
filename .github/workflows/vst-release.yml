@@ -3,7 +3,7 @@
 # smoke-test it, and publish the draft (see mpc-vst-plugins docs/RELEASING.md).
 # dry_run builds the zip and skin previews as run artifacts only.
 #
-# tools_ref is pinned to a commit on mpc-vst-plugins main (it has the label_scale= layout key this skin
+# tools_ref is pinned to a commit on mpc-vst-plugins main (the portable one-folder layout; it has the label_scale= layout key this skin
 # depends on, docs/SKIN_STUDIO.md, and the plugin_id/license catalog inputs).
 name: VST release (draft)
 
@@ -20,13 +20,13 @@ on:
 
 jobs:
   acid:
-    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@259f75d0ce0f836cfd89cc0a33c550b55917cffc
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@cd4d68b0752191c5a59ee0864cf4bace8d7a87ee
     permissions:
       contents: write
     with:
       tag: acid-vst-v${{ inputs.version }}
       version: ${{ inputs.version }}
-      tools_ref: 259f75d0ce0f836cfd89cc0a33c550b55917cffc
+      tools_ref: cd4d68b0752191c5a59ee0864cf4bace8d7a87ee
       vst_dir: vst
       build: vst/build.sh
       host_test: vst/test.sh
