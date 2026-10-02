@@ -23,9 +23,9 @@ docker run --rm -u "$U" -e HOME=/tmp -v "$PWD":/w -v "$MPC_VST":/mv:ro -w /w mpc
 
 cp "$MPC_VST/wrapper/popup.h" build/   # popup open-flag handling shared with mpc-vst's own wrapper
 
-# 3. the plugin (armhf, glibc 2.36 so it loads on the device's 2.39)
-docker run --rm --platform linux/arm/v7 -v "$PWD/..":/b -w /b/vst arm32v7/gcc:12 bash -euxc '
-  apt-get update -qq && apt-get install -y -qq libasound2-dev >/dev/null
+# 3. the plugin (armhf, glibc 2.31 (bullseye) so it loads on MPC OS 2.x (2.32) and 3.x (2.39))
+docker run --rm --platform linux/arm/v7 -v "$PWD/..":/b -w /b/vst arm32v7/gcc:11-bullseye bash -euxc '
+  apt-get update -qq && apt-get install -y -qq -t bullseye libasound2-dev >/dev/null
   mkdir -p build/obj
   gcc -O2 -fPIC -fvisibility=hidden -std=gnu11 -I../src -c ../src/acid_core.c -o build/obj/core.o
   g++ -O2 -fPIC -fvisibility=hidden -std=c++17 -Wall -Wextra -Wno-unused-parameter \
@@ -35,7 +35,7 @@ docker run --rm --platform linux/arm/v7 -v "$PWD/..":/b -w /b/vst arm32v7/gcc:12
   strip build/acid.so
   echo "-- exported --"; readelf --dyn-syms -W build/acid.so | grep -E " GLOBAL .* [0-9]+ [A-Za-z]" | grep -v UND
   echo "-- needed --"; readelf -d build/acid.so | grep NEEDED
-  echo "-- highest glibc (device has 2.39) --"; readelf -V build/acid.so | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1
+  echo "-- highest glibc (must be <= 2.32) --"; readelf -V build/acid.so | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1
   chown -R '"$U"' build
 '
 md5sum build/acid.so
