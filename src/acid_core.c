@@ -142,12 +142,26 @@ typedef struct {
     uint8_t steps[MAX_STEPS];
     uint8_t degrees[MAX_STEPS];
     uint8_t octaves[MAX_STEPS];
+
+    /* VST port -- LIVE KNOBS. Generate no longer bakes Density/Accent/Slide/
+     * Octaves/Algo into the pattern; it only rolls the dice below, one set per
+     * step for all MAX_STEPS, and derive_pattern() turns dice + the knobs'
+     * CURRENT values into steps[]/degrees[]/octaves[]. Re-running it whenever
+     * one of those knobs (or Length/Scale) moves reshapes the playing pattern
+     * on the spot, and reversibly: each die is compared against a threshold,
+     * so turning Density up only ever adds notes and turning it back down
+     * removes exactly those again. Mutate re-rolls ~25% of the dice. */
+    float d_gate[MAX_STEPS], d_root[MAX_STEPS], d_deg[MAX_STEPS], d_oct[MAX_STEPS];
+    float d_acc[MAX_STEPS], d_slide[MAX_STEPS];           /* primary generator */
+    int8_t x_walk[MAX_STEPS];                             /* secondary: density walk delta -1/0/+1 */
+    float x_deg[MAX_STEPS], x_oct[MAX_STEPS], x_slide[MAX_STEPS];
+    float d_mix[MAX_STEPS];                               /* primary/secondary pick (Algo) */
     int length;
     int position;
 
     /* Knobs */
     float density, accent, slide;
-    int octave_range;   /* 1..3 */
+    int octave_range;   /* 1..5 */
     float gate;         /* 0.05..1.0, fraction of a step */
     int algo;           /* 1..16 */
 
@@ -272,184 +286,156 @@ static float rng_next_f(uint32_t *rng) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* Primary generator -- tb3po's density/accent/slide/octave model verbatim */
+/* Generators -- VST port: split into "roll the dice" (Generate/Mutate) and */
+/* "read the dice through the knobs" (derive_pattern), see acid_seq_t.      */
+/* The decisions are tb3po's / Sting's as before; only WHEN the knobs are   */
+/* read has changed (now, instead of at the last Generate).                 */
 /* ---------------------------------------------------------------------- */
 
-static void gen_primary(const acid_seq_t *s, uint32_t *rng, int scale_idx,
-                         uint8_t *out_steps, uint8_t *out_deg, uint8_t *out_oct) {
-    const scale_t *sc = &SCALES[scale_idx];
-    for (int i = 0; i < s->length; i++) {
-        if (rng_next_f(rng) > s->density) {
-            out_steps[i] = STEP_REST;
-            continue;
-        }
-        int on_beat = (i % 4 == 0);
-        int degree;
-        if (on_beat && rng_next_f(rng) < 0.35f) {
-            degree = 0;
-        } else {
-            degree = (int)(rng_next_f(rng) * (float)sc->len);
-            if (degree >= sc->len) degree = sc->len - 1;
-        }
-        out_deg[i] = (uint8_t)degree;
-
-        int oct = (int)(rng_next_f(rng) * (float)s->octave_range);
-        if (oct >= s->octave_range) oct = s->octave_range - 1;
-        out_oct[i] = (uint8_t)oct;
-
-        int kind = STEP_NOTE;
-        if (rng_next_f(rng) < s->accent) kind = STEP_ACCENT;
-        if (rng_next_f(rng) < s->slide) kind = STEP_SLIDE;
-        out_steps[i] = (uint8_t)kind;
-    }
-
-    /* Slide-into-rest is a no-op -- demote to a plain note. */
-    for (int i = 0; i < s->length; i++) {
-        int nxt = (i + 1) % s->length;
-        if (out_steps[i] == STEP_SLIDE && out_steps[nxt] == STEP_REST) out_steps[i] = STEP_NOTE;
-    }
-
-    int any = 0;
-    for (int i = 0; i < s->length; i++) if (out_steps[i] != STEP_REST) { any = 1; break; }
-    if (!any) { out_steps[0] = STEP_NOTE; out_deg[0] = 0; out_oct[0] = 0; }
+static int die_index(float d, int n) {   /* 0..1 die -> 0..n-1 */
+    int k = (int)(d * (float)n);
+    if (k >= n) k = n - 1;
+    if (k < 0) k = 0;
+    return k;
 }
 
-/* ---------------------------------------------------------------------- */
-/* Secondary generator -- Sting.amxd-inspired                              */
-/* ---------------------------------------------------------------------- */
+/* Slide-into-rest is a no-op -- demote to a plain note; and never all-rest. */
+static void tidy_steps(const acid_seq_t *s, uint8_t *st, uint8_t *deg, uint8_t *oct) {
+    for (int i = 0; i < s->length; i++) {
+        int nxt = (i + 1) % s->length;
+        if (st[i] == STEP_SLIDE && st[nxt] == STEP_REST) st[i] = STEP_NOTE;
+    }
+    int any = 0;
+    for (int i = 0; i < s->length; i++) if (st[i] != STEP_REST) { any = 1; break; }
+    if (!any) { st[0] = STEP_NOTE; deg[0] = 0; oct[0] = 0; }
+}
 
-static void gen_secondary(const acid_seq_t *s, uint32_t *rng, int scale_idx,
+/* Primary -- tb3po's density/accent/slide/octave model. */
+static void derive_primary(const acid_seq_t *s, int scale_idx,
                            uint8_t *out_steps, uint8_t *out_deg, uint8_t *out_oct) {
     const scale_t *sc = &SCALES[scale_idx];
+    for (int i = 0; i < s->length; i++) {
+        out_deg[i] = (uint8_t)((i % 4 == 0 && s->d_root[i] < 0.35f) ? 0 : die_index(s->d_deg[i], sc->len));
+        out_oct[i] = (uint8_t)die_index(s->d_oct[i], s->octave_range);
+        if (s->d_gate[i] > s->density) { out_steps[i] = STEP_REST; continue; }
+        int kind = STEP_NOTE;
+        if (s->d_acc[i] < s->accent) kind = STEP_ACCENT;
+        if (s->d_slide[i] < s->slide) kind = STEP_SLIDE;
+        out_steps[i] = (uint8_t)kind;
+    }
+    tidy_steps(s, out_steps, out_deg, out_oct);
+}
 
-    /* "Classic" (urn 12/16 in the patch): a bag of scale-degree indices,
-     * drawn without repeat until exhausted, then reshuffled by refilling. */
-    uint8_t bag[12];
-    int bag_n = sc->len;
-    for (int k = 0; k < bag_n; k++) bag[k] = (uint8_t)k;
-
-    /* "CakeWalk": a bounded random walk drives gate/rest density instead of
-     * an independent per-step coin flip. Density knob sets where the walk
-     * starts (and roughly where it idles). */
+/* Secondary -- Sting.amxd-inspired: "CakeWalk" (a bounded random walk drives
+ * gate/rest; Density sets where it starts and roughly idles), "Classic"
+ * (degrees drawn from a bag without repeats, rolled at Generate) and
+ * "VelPyra" (the first N pyramid slots, N from the Accent knob, are accented). */
+static void derive_secondary(const acid_seq_t *s, int scale_idx,
+                             uint8_t *out_steps, uint8_t *out_deg, uint8_t *out_oct) {
+    const scale_t *sc = &SCALES[scale_idx];
     int walk = (int)(s->density * 8.0f);
     if (walk < 0) walk = 0;
     if (walk > 8) walk = 8;
 
-    /* "VelPyra": mark the first N pyramid slots (N set by the Accent knob)
-     * as accented, instead of rolling accent independently per step. */
     int accent_count = (int)(s->accent * 16.0f + 0.5f);
     if (accent_count > 16) accent_count = 16;
     uint8_t accented[MAX_STEPS];
     memset(accented, 0, sizeof(accented));
-    for (int k = 0; k < accent_count; k++) {
-        int pos = VEL_PYRAMID[k] % s->length;
-        accented[pos] = 1;
-    }
+    for (int k = 0; k < accent_count; k++) accented[VEL_PYRAMID[k] % s->length] = 1;
 
     for (int i = 0; i < s->length; i++) {
-        int step_delta = (int)(rng_next_f(rng) * 3.0f) - 1; /* -1, 0, +1 */
-        walk += step_delta;
+        walk += s->x_walk[i];
         if (walk < 0) walk = 0;
         if (walk > 8) walk = 8;
-
-        if (walk < 2) {
-            out_steps[i] = STEP_REST;
-            continue;
-        }
-
-        if (bag_n == 0) {
-            bag_n = sc->len;
-            for (int k = 0; k < bag_n; k++) bag[k] = (uint8_t)k;
-        }
-        int idx = (int)(rng_next_f(rng) * (float)bag_n);
-        if (idx >= bag_n) idx = bag_n - 1;
-        int degree = bag[idx];
-        bag[idx] = bag[--bag_n];
-        out_deg[i] = (uint8_t)degree;
-
-        int oct = (int)(rng_next_f(rng) * (float)s->octave_range);
-        if (oct >= s->octave_range) oct = s->octave_range - 1;
-        out_oct[i] = (uint8_t)oct;
-
+        out_deg[i] = (uint8_t)die_index(s->x_deg[i], sc->len);
+        out_oct[i] = (uint8_t)die_index(s->x_oct[i], s->octave_range);
+        if (walk < 2) { out_steps[i] = STEP_REST; continue; }
         int kind = accented[i] ? STEP_ACCENT : STEP_NOTE;
-        if (rng_next_f(rng) < s->slide) kind = STEP_SLIDE;
+        if (s->x_slide[i] < s->slide) kind = STEP_SLIDE;
         out_steps[i] = (uint8_t)kind;
     }
-
-    for (int i = 0; i < s->length; i++) {
-        int nxt = (i + 1) % s->length;
-        if (out_steps[i] == STEP_SLIDE && out_steps[nxt] == STEP_REST) out_steps[i] = STEP_NOTE;
-    }
-
-    int any = 0;
-    for (int i = 0; i < s->length; i++) if (out_steps[i] != STEP_REST) { any = 1; break; }
-    if (!any) { out_steps[0] = STEP_NOTE; out_deg[0] = 0; out_oct[0] = 0; }
+    tidy_steps(s, out_steps, out_deg, out_oct);
 }
 
-/* Algo (1-16) sets the per-step substitution weight of secondary into
- * primary: 1 = 100% primary (tb3po's exact behaviour), 16 = mostly
- * secondary -- directly reproducing the mechanism a comment in Sting.amxd
- * describes ("which notes in the random sequence will be replaced by the
- * 2nd generator and how often"). One evolving PRNG stream is threaded
- * through primary generation, secondary generation and the mix decision,
- * and its final state is persisted so a later Mutate keeps evolving from
- * here rather than repeating itself. */
-static void regenerate_pattern(acid_seq_t *s, int scale_idx, uint32_t seed) {
-    uint32_t rng = seed ? seed : 1;
-    s->seed = seed;
-
+/* Dice + current knobs -> the pattern that plays. Algo (1-16) sets the
+ * per-step substitution weight of secondary into primary: 1 = 100% primary
+ * (tb3po's behaviour), 16 = all secondary. Cheap (a few compares per step),
+ * called from set_param under the same lock as playback. */
+static void derive_pattern(acid_seq_t *s, int scale_idx) {
     uint8_t p_steps[MAX_STEPS], p_deg[MAX_STEPS], p_oct[MAX_STEPS];
-    gen_primary(s, &rng, scale_idx, p_steps, p_deg, p_oct);
-
+    uint8_t x_steps[MAX_STEPS], x_deg[MAX_STEPS], x_oct[MAX_STEPS];
+    memset(p_steps, 0, sizeof p_steps); memset(p_deg, 0, sizeof p_deg); memset(p_oct, 0, sizeof p_oct);
+    memset(x_steps, 0, sizeof x_steps); memset(x_deg, 0, sizeof x_deg); memset(x_oct, 0, sizeof x_oct);
+    derive_primary(s, scale_idx, p_steps, p_deg, p_oct);
     float weight = (float)(s->algo - 1) / 15.0f;
-    if (weight <= 0.0f) {
-        memcpy(s->steps, p_steps, MAX_STEPS);
-        memcpy(s->degrees, p_deg, MAX_STEPS);
-        memcpy(s->octaves, p_oct, MAX_STEPS);
-        s->rng = rng;
-        return;
-    }
-
-    uint8_t sec_steps[MAX_STEPS], sec_deg[MAX_STEPS], sec_oct[MAX_STEPS];
-    gen_secondary(s, &rng, scale_idx, sec_steps, sec_deg, sec_oct);
-
-    for (int i = 0; i < s->length; i++) {
-        if (rng_next_f(&rng) < weight) {
-            s->steps[i] = sec_steps[i]; s->degrees[i] = sec_deg[i]; s->octaves[i] = sec_oct[i];
+    if (weight > 0.0f) derive_secondary(s, scale_idx, x_steps, x_deg, x_oct);
+    for (int i = 0; i < MAX_STEPS; i++) {
+        if (weight > 0.0f && s->d_mix[i] < weight) {
+            s->steps[i] = x_steps[i]; s->degrees[i] = x_deg[i]; s->octaves[i] = x_oct[i];
         } else {
             s->steps[i] = p_steps[i]; s->degrees[i] = p_deg[i]; s->octaves[i] = p_oct[i];
         }
     }
-    s->rng = rng;
 }
 
-/* Nudge ~25% of steps -- ported from tb3po's mutate_pattern. Algorithm-
- * agnostic: it nudges whatever pattern is currently live, regardless of
- * which Algo blend produced it. */
-static void mutate_pattern(acid_seq_t *s, int scale_idx) {
+/* Generate: roll a fresh set of dice for every step from `seed`, then derive.
+ * The PRNG's final state is persisted so a later Mutate keeps evolving from
+ * here rather than repeating itself. */
+static void regenerate_pattern(acid_seq_t *s, int scale_idx, uint32_t seed) {
     const scale_t *sc = &SCALES[scale_idx];
+    uint32_t rng = seed ? seed : 1;
+    s->seed = seed;
+
+    uint8_t bag[12];
+    int bag_n = 0;
+    for (int i = 0; i < MAX_STEPS; i++) {
+        s->d_gate[i] = rng_next_f(&rng);
+        s->d_root[i] = rng_next_f(&rng);
+        s->d_deg[i] = rng_next_f(&rng);
+        s->d_oct[i] = rng_next_f(&rng);
+        s->d_acc[i] = rng_next_f(&rng);
+        s->d_slide[i] = rng_next_f(&rng);
+
+        s->x_walk[i] = (int8_t)((int)(rng_next_f(&rng) * 3.0f) - 1); /* -1, 0, +1 */
+        if (bag_n == 0) {   /* scale degrees without repeat until the bag is empty, then refill */
+            bag_n = sc->len;
+            for (int k = 0; k < bag_n; k++) bag[k] = (uint8_t)k;
+        }
+        int idx = die_index(rng_next_f(&rng), bag_n);
+        int degree = bag[idx];
+        bag[idx] = bag[--bag_n];
+        s->x_deg[i] = ((float)degree + 0.5f) / (float)sc->len;   /* as a die, so a Scale change re-reads it */
+        s->x_oct[i] = rng_next_f(&rng);
+        s->x_slide[i] = rng_next_f(&rng);
+
+        s->d_mix[i] = rng_next_f(&rng);
+    }
+    s->rng = rng;
+    derive_pattern(s, scale_idx);
+}
+
+/* Nudge ~25% of steps -- after tb3po's mutate_pattern: half of them get new
+ * rhythm dice (rest/note, accent, slide), the other half new pitch dice. */
+static void mutate_pattern(acid_seq_t *s, int scale_idx) {
     uint32_t rng = s->rng;
-    for (int i = 0; i < s->length; i++) {
+    for (int i = 0; i < MAX_STEPS; i++) {
         if (rng_next_f(&rng) >= 0.25f) continue;
         if (rng_next_f(&rng) < 0.5f) {
-            if (rng_next_f(&rng) > s->density) {
-                s->steps[i] = STEP_REST;
-            } else {
-                int kind = STEP_NOTE;
-                if (rng_next_f(&rng) < s->accent) kind = STEP_ACCENT;
-                if (rng_next_f(&rng) < s->slide) kind = STEP_SLIDE;
-                s->steps[i] = (uint8_t)kind;
-            }
+            s->d_gate[i] = rng_next_f(&rng);
+            s->d_acc[i] = rng_next_f(&rng);
+            s->d_slide[i] = rng_next_f(&rng);
+            s->x_walk[i] = (int8_t)((int)(rng_next_f(&rng) * 3.0f) - 1);
+            s->x_slide[i] = rng_next_f(&rng);
         } else {
-            int degree = (int)(rng_next_f(&rng) * (float)sc->len);
-            if (degree >= sc->len) degree = sc->len - 1;
-            s->degrees[i] = (uint8_t)degree;
-            int oct = (int)(rng_next_f(&rng) * (float)s->octave_range);
-            if (oct >= s->octave_range) oct = s->octave_range - 1;
-            s->octaves[i] = (uint8_t)oct;
+            s->d_root[i] = 1.0f;   /* a mutated downbeat takes its new pitch, not the root again */
+            s->d_deg[i] = rng_next_f(&rng);
+            s->d_oct[i] = rng_next_f(&rng);
+            s->x_deg[i] = rng_next_f(&rng);
+            s->x_oct[i] = rng_next_f(&rng);
         }
     }
     s->rng = rng;
+    derive_pattern(s, scale_idx);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1286,21 +1272,29 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
             if (v < 0.0f) v = 0.0f;
             if (v > 1.0f) v = 1.0f;
             s->density = v;
+            derive_pattern(s, t->scale);
         } else if (strcmp(k, "accent") == 0) {
             float v = parse_float(val, 0.4f);
             if (v < 0.0f) v = 0.0f;
             if (v > 1.0f) v = 1.0f;
             s->accent = v;
+            derive_pattern(s, t->scale);
         } else if (strcmp(k, "slide") == 0) {
             float v = parse_float(val, 0.25f);
             if (v < 0.0f) v = 0.0f;
             if (v > 1.0f) v = 1.0f;
             s->slide = v;
+            derive_pattern(s, t->scale);
         } else if (strcmp(k, "octaves") == 0) {
-            int v = parse_int(val, 2);
+            /* VST port: range widened from 1..3 to 1..5, and rounded rather than
+             * truncated -- the VST wrapper sends the knob as a float ("3.6"), which
+             * parse_int cut down so the top value was only reachable at the very end
+             * of the knob's travel. */
+            int v = (int)(parse_float(val, 2.0f) + 0.5f);
             if (v < 1) v = 1;
-            if (v > 3) v = 3;
+            if (v > 5) v = 5;
             s->octave_range = v;
+            derive_pattern(s, t->scale);
         } else if (strcmp(k, "length") == 0) {
             /* Declared as a float chain_param (min 2, max 32) so the knob rides
              * the range-normalised curve instead of one-step-per-detent -- the
@@ -1311,6 +1305,7 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
             s->length = v;
             if (s->position >= v) s->position = v - 1;
             if (s->offset >= v) s->offset = v - 1;  /* keep Offset < the new length */
+            derive_pattern(s, t->scale);
         } else if (strcmp(k, "gate") == 0) {
             float v = parse_float(val, 0.5f);
             if (v < 0.05f) v = 0.05f;
@@ -1321,6 +1316,7 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
             if (v < 1) v = 1;
             if (v > 16) v = 16;
             s->algo = v;
+            derive_pattern(s, t->scale);
         } else if (strcmp(k, "tune") == 0) {
             int v = parse_int(val, 0);
             if (v < -ACID_MAX_TUNE) v = -ACID_MAX_TUNE;
@@ -1365,6 +1361,7 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
         int v = parse_int(val, 9) % 12; if (v < 0) v += 12; t->root = v;
     } else if (strcmp(key, "scale") == 0) {
         int v = parse_int(val, 0); if (v < 0 || v >= NUM_SCALES) v = 0; t->scale = v;
+        for (int i = 0; i < NUM_SEQS; i++) derive_pattern(&t->seq[i], t->scale);
     } else if (strcmp(key, "blend") == 0) {
         int v = parse_int(val, 0);
         if (v < -63) v = -63;
@@ -1460,7 +1457,7 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
             "{\"key\":\"a_density\",\"name\":\"Density A\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"step\":0.01,\"default\":0.7,\"unit\":\"%\"},"
             "{\"key\":\"a_accent\",\"name\":\"Accent A\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"step\":0.01,\"default\":0.4,\"unit\":\"%\"},"
             "{\"key\":\"a_slide\",\"name\":\"Slide A\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"step\":0.01,\"default\":0.25,\"unit\":\"%\"},"
-            "{\"key\":\"a_octaves\",\"name\":\"Octaves A\",\"type\":\"int\",\"min\":1,\"max\":3,\"step\":1,\"default\":2},"
+            "{\"key\":\"a_octaves\",\"name\":\"Octaves A\",\"type\":\"int\",\"min\":1,\"max\":5,\"step\":1,\"default\":2},"
             "{\"key\":\"a_length\",\"name\":\"Length A\",\"type\":\"float\",\"min\":2,\"max\":32,\"step\":1,\"default\":16,\"display_format\":\".0f\"},"
             "{\"key\":\"a_gate\",\"name\":\"Gate A\",\"type\":\"float\",\"min\":0.05,\"max\":1.0,\"step\":0.01,\"default\":0.5,\"unit\":\"%\"},"
             "{\"key\":\"b_generate\",\"name\":\"Generate B\",\"type\":\"enum\",\"options\":[\"off\",\"go\"],\"access\":\"write\"},"
@@ -1468,7 +1465,7 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
             "{\"key\":\"b_density\",\"name\":\"Density B\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"step\":0.01,\"default\":0.7,\"unit\":\"%\"},"
             "{\"key\":\"b_accent\",\"name\":\"Accent B\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"step\":0.01,\"default\":0.4,\"unit\":\"%\"},"
             "{\"key\":\"b_slide\",\"name\":\"Slide B\",\"type\":\"float\",\"min\":0.0,\"max\":1.0,\"step\":0.01,\"default\":0.25,\"unit\":\"%\"},"
-            "{\"key\":\"b_octaves\",\"name\":\"Octaves B\",\"type\":\"int\",\"min\":1,\"max\":3,\"step\":1,\"default\":2},"
+            "{\"key\":\"b_octaves\",\"name\":\"Octaves B\",\"type\":\"int\",\"min\":1,\"max\":5,\"step\":1,\"default\":2},"
             "{\"key\":\"b_length\",\"name\":\"Length B\",\"type\":\"float\",\"min\":2,\"max\":32,\"step\":1,\"default\":16,\"display_format\":\".0f\"},"
             "{\"key\":\"b_gate\",\"name\":\"Gate B\",\"type\":\"float\",\"min\":0.05,\"max\":1.0,\"step\":0.01,\"default\":0.5,\"unit\":\"%\"},"
             "{\"key\":\"scale\",\"name\":\"Scale\",\"type\":\"enum\",\"options\":[\"Minor\",\"Phrygian\",\"HarmMinor\",\"MinPent\",\"Dorian\",\"Major\",\"PhrygDom\",\"Locrian\",\"WholeTone\",\"HungMinor\",\"MinBlues\",\"Chromatic\"],\"default\":0},"

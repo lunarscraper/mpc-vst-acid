@@ -25,14 +25,14 @@ on both pages.
 
 | Control | What it does |
 |---|---|
-| GENERATE | Re-roll the whole pattern from a new random seed. DENSITY, ACCENT, SLIDE, OCTAVES and ALGO are read at this moment, so they shape the *next* pattern, not the one playing |
+| GENERATE | Re-roll the whole pattern from a new random seed |
 | MUTATE | Nudge about 25% of the steps in place (rest/note, pitch), keeping the pattern recognisable. Repeat it to keep evolving |
 | DENSITY | Chance that a step is a note rather than a rest |
 | ACCENT | Chance that a note is accented (louder) |
 | SLIDE | Chance that a note slides into the next step, 303-style. A slide into a rest becomes a plain note |
-| OCTAVES | How many octaves above the root the pitches can span, 1 to 3 |
+| OCTAVES | How many octaves above the root the pitches can span, 1 to 5 |
 | ALGO | 1 is the classic density/accent/slide model. Higher values blend in a second generator (non-repeating pitches, random-walk density, pyramid accents), up to 16 |
-| LENGTH | Steps before the pattern loops, 2 to 32. It takes effect at once. GENERATE to fill a longer pattern with new steps |
+| LENGTH | Steps before the pattern loops, 2 to 32. It takes effect at once |
 | GATE | Note length as a fraction of a step. It is live, and held slides ignore it |
 | OFFSET (A) / TUNE OFFSET (B) | OFFSET rotates which step plays without rewriting the pattern. TUNE OFFSET sets B's interval relative to A, ±24 semitones (+7 is a fifth above, -12 an octave below) |
 | DIR | Forward, reverse, or pendulum (bounces off each end) |
@@ -40,7 +40,8 @@ on both pages.
 | MIDI CH | MIDI channel the line plays on |
 | BLEND A>B | The same control as on GLOBAL |
 
-DENSITY, ACCENT, SLIDE and OCTAVES only affect the next GENERATE or MUTATE.
+Every knob is live: DENSITY, ACCENT, SLIDE, OCTAVES and ALGO reshape the pattern that is playing, and turning a
+knob back brings the earlier pattern back. GENERATE and MUTATE change the pattern itself.
 
 ### GLOBAL
 | Control | What it does |
