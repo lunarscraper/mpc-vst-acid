@@ -1,5 +1,8 @@
 # Acid for MPC / Force
 
+> **Requires MPC OS 3.x.** MPC OS 2.x needs further development: the touchscreen skins do not draw there yet (the page
+> stays empty). See [MPC OS 2.x vs 3.x](https://github.com/sd88me/mpc-vst-plugins#mpc-os-2x-vs-3x) in the main repo.
+
 A TB-303-style acid bassline sequencer for the Akai MPC OS built-in plugin host. It generates two
 bass lines, lets you blend between them, and plays them over MIDI into a synth track. Acid makes
 no sound itself. It is a native VST2 plugin with a touchscreen skin and Q-Link control.
