@@ -273,12 +273,17 @@ static void feed_transport(Plugin *w, int32_t frames) {
     }
     w->was_playing = playing;
 
-    if (playing && ti) {
+    if (playing && ti && ti->tempo > 0) {
+        /* The pulses inside THIS block's own window [ppqPos, ppqPos + block length), half-open
+         * so a pulse on a block boundary counts exactly once. Measuring from the previous
+         * block's ppqPos instead lost the downbeat pulse every time the sequence looped
+         * (ppqPos jumps back, the "resync" branch skipped it): one 24-PPQN pulse per loop
+         * pass, so Acid drifted behind the MPC by 1/24 beat each loop. */
         const double step = 1.0 / 24.0;   /* 24 PPQN, in quarter notes */
-        double start = w->last_ppq, end = ti->ppqPos;
-        if (end < start || end - start > 1.0) start = end;   /* loop/rewind/jump: resync, don't flood pulses */
-        double next = std::ceil(start / step) * step;
-        for (; next < end + 1e-9; next += step) {
+        double sr = (ti->sampleRate > 0) ? ti->sampleRate : (double)MOVE_SAMPLE_RATE;
+        double start = ti->ppqPos, end = start + frames * (ti->tempo / 60.0) / sr;
+        double next = std::ceil(start / step - 1e-9) * step;
+        for (; next < end - 1e-9; next += step) {
             msg[0] = 0xF8;
             int n;
             { std::lock_guard<std::mutex> lk(w->lock); n = g_api->process_midi(w->inst, msg, 1, out, olen, MIDI_FX_MAX_OUT_MSGS); }
