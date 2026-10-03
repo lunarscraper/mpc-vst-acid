@@ -70,7 +70,19 @@ repeatable rather than random.
 | LOCK | Plays only where both lines have a note: sparse and tight | Same sweep as FILL |
 | CHAIN | Call and response: A plays a full pass, then B answers with a full pass | Sets the pass ratio. Centre is one pass each, and the ends give one side up to 8:1 |
 
-Settings are saved with your project.
+Settings and both sequences are saved with your project and with plugin presets, so a reloaded project or
+preset plays the same lines again.
+
+### Presets
+Acid has 32 preset slots, shared by all projects. A slot holds every setting and both sequences.
+
+- **PRESET** (GLOBAL page) picks a slot. Turning it only browses; nothing changes yet.
+- **SAVE** writes the current state to the picked slot, overwriting it.
+- **LOAD** loads the picked slot. An empty slot leaves everything as it is.
+- The slots are also the plugin's programs, so the PRESET list at the top of the plugin window shows them, and
+  picking one there loads it.
+
+The slots live in `acid_presets.txt` next to the plugin folder on the SD card. Copy that file to back them up.
 
 ## What you need
 - A first-generation MPC OS standalone device (32-bit ARM): Force, MPC Live / Live II, One, X or Key 61.

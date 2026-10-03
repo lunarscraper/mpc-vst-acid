@@ -438,6 +438,64 @@ static void mutate_pattern(acid_seq_t *s, int scale_idx) {
     derive_pattern(s, scale_idx);
 }
 
+/* VST port -- the sequence itself as text, for the project/preset chunk
+ * (get_param/set_param "a_dice"/"b_dice"). Without it only the knob values
+ * were saved and a reloaded project or preset came back with the default
+ * pattern. "D1" + rng + seed (8 hex each), then per step ten dice as 16-bit
+ * hex and the walk delta as one digit. Hex only, so it can't collide with the
+ * chunk's "key=value;" separators. */
+#define DICE_STR_LEN (2 + 16 + MAX_STEPS * 41)
+static int dice_to_str(const acid_seq_t *s, char *buf, int buf_len) {
+    if (buf_len < DICE_STR_LEN + 1) return -1;
+    char *w = buf;
+    w += sprintf(w, "D1%08x%08x", (unsigned)s->rng, (unsigned)s->seed);
+    for (int i = 0; i < MAX_STEPS; i++) {
+        const float d[10] = { s->d_gate[i], s->d_root[i], s->d_deg[i], s->d_oct[i], s->d_acc[i],
+                              s->d_slide[i], s->x_deg[i], s->x_oct[i], s->x_slide[i], s->d_mix[i] };
+        for (int k = 0; k < 10; k++) {
+            float v = d[k] < 0.0f ? 0.0f : d[k] > 1.0f ? 1.0f : d[k];
+            w += sprintf(w, "%04x", (unsigned)(v * 65535.0f + 0.5f));
+        }
+        *w++ = (char)('1' + s->x_walk[i]);   /* '0','1','2' = -1, 0, +1 */
+    }
+    *w = 0;
+    return (int)(w - buf);
+}
+static int hex_n(const char *p, int n, unsigned *out) {
+    unsigned v = 0;
+    for (int i = 0; i < n; i++) {
+        char c = p[i];
+        int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+                (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) return 0;
+        v = (v << 4) | (unsigned)d;
+    }
+    *out = v;
+    return 1;
+}
+static int dice_from_str(acid_seq_t *s, const char *str) {   /* all or nothing */
+    if (!str || strlen(str) != DICE_STR_LEN || str[0] != 'D' || str[1] != '1') return 0;
+    acid_seq_t tmp = *s;
+    unsigned v;
+    const char *p = str + 2;
+    if (!hex_n(p, 8, &v)) return 0;
+    tmp.rng = v ? v : 1; p += 8;
+    if (!hex_n(p, 8, &v)) return 0;
+    tmp.seed = v; p += 8;
+    for (int i = 0; i < MAX_STEPS; i++) {
+        float *d[10] = { &tmp.d_gate[i], &tmp.d_root[i], &tmp.d_deg[i], &tmp.d_oct[i], &tmp.d_acc[i],
+                         &tmp.d_slide[i], &tmp.x_deg[i], &tmp.x_oct[i], &tmp.x_slide[i], &tmp.d_mix[i] };
+        for (int k = 0; k < 10; k++) {
+            if (!hex_n(p, 4, &v)) return 0;
+            *d[k] = (float)v / 65535.0f; p += 4;
+        }
+        if (*p < '0' || *p > '2') return 0;
+        tmp.x_walk[i] = (int8_t)(*p++ - '1');
+    }
+    *s = tmp;
+    return 1;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Playback                                                                */
 /* ---------------------------------------------------------------------- */
@@ -1258,6 +1316,9 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
             if (s->position >= s->length) s->position = s->length - 1;
         } else if (strcmp(k, "mutate") == 0) {
             mutate_pattern(s, t->scale);
+        } else if (strcmp(k, "dice") == 0) {
+            /* VST port: restore a saved sequence (see dice_to_str) */
+            if (dice_from_str(s, val)) derive_pattern(s, t->scale);
         } else if (strcmp(k, "dump") == 0) {
             /* FORCE-ONLY: (re)start this seq's Export dump player -- see
              * process_dump_for_seq(). Always restarts from step 0, even if
@@ -1409,6 +1470,7 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
 
     if (seq_idx >= 0) {
         acid_seq_t *s = &t->seq[seq_idx];
+        if (strcmp(k, "dice") == 0) return dice_to_str(s, buf, buf_len);   /* VST port: the sequence itself */
         if (strcmp(k, "density") == 0) n = snprintf(buf, buf_len, "%.3f", s->density);
         else if (strcmp(k, "accent") == 0) n = snprintf(buf, buf_len, "%.3f", s->accent);
         else if (strcmp(k, "slide") == 0) n = snprintf(buf, buf_len, "%.3f", s->slide);

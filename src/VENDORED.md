@@ -10,5 +10,7 @@ submodule so this VST port stays self-contained. Local changes against the
 source commit above: (1) Octaves A/B range widened from 1..3 to 1..5 and rounded
 instead of truncated (set_param "octaves" and the embedded chain_params);
 (2) live knobs: Generate/Mutate roll per-step dice, derive_pattern() reads them
-through the current Density/Accent/Slide/Octaves/Algo/Length/Scale values; re-vendor by diffing against force-acid's `src/` at a
+through the current Density/Accent/Slide/Octaves/Algo/Length/Scale values;
+(3) get_param/set_param "a_dice"/"b_dice": the sequence as text, for the
+project/preset chunk; re-vendor by diffing against force-acid's `src/` at a
 newer commit and copying over both files if the engine changes.

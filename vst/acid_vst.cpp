@@ -68,7 +68,8 @@ typedef struct {
 } VstTimeInfo;
 
 enum {
-    effOpen = 0, effClose = 1, effGetParamLabel = 6, effGetParamDisplay = 7, effGetParamName = 8,
+    effOpen = 0, effClose = 1, effSetProgram = 2, effGetProgram = 3, effSetProgramName = 4,
+    effGetProgramName = 5, effGetProgramNameIndexed = 29, effGetParamLabel = 6, effGetParamDisplay = 7, effGetParamName = 8,
     effSetSampleRate = 10, effSetBlockSize = 11, effMainsChanged = 12, effGetChunk = 23,
     effSetChunk = 24, effProcessEvents = 25, effCanBeAutomated = 26, effGetPlugCategory = 35,
     effGetEffectName = 45, effGetVendorString = 47, effGetProductString = 48,
@@ -91,7 +92,11 @@ static int   host_get_clock_status(void) { return g_clock_status.load(); }
 static const host_api_v1_t g_host = { host_get_bpm, host_get_clock_status };
 static midi_fx_api_v1_t *g_api = nullptr;
 static std::mutex g_api_init_lock;
-static std::atomic<int> g_instance_count{0};
+/* Port names by lowest free slot, given back on close. A plain counter never went down, so
+ * an instance the host re-created (removing and re-adding the plugin, possibly loading a
+ * preset) came back as "Acid 2" and the synth track listening on "Acid" went silent. */
+static std::mutex g_slot_lock;
+static bool g_slot_used[32];
 static FILE *g_log;
 #define LOG(...) do { if (g_log) { std::fprintf(g_log, __VA_ARGS__); std::fflush(g_log); } } while (0)
 
@@ -155,7 +160,92 @@ static inline bool ppq_clock_block(PpqClock *c, double ppq, double tempo, double
     return true;
 }
 
-#define BUILD_ID "clockfix-2026-10-03"
+#define BUILD_ID "presets32-2026-10-03"
+
+/* ---------------------------------------------------------------------------
+ * Preset bank: NSLOTS slots shared by every Acid instance and every project,
+ * kept in one text file on the SD card (one line per used slot:
+ * "index<TAB>name<TAB>chunk"). A slot holds the same "key=value;" chunk a
+ * project saves: all knobs plus both sequences. The slots are also the
+ * plugin's VST programs, so the host's PRESET list shows and selects them;
+ * the PRESET knob + LOAD/SAVE buttons on the GLOBAL page do the same from
+ * the skin, whatever the host does with programs.
+ * ------------------------------------------------------------------------- */
+#define NSLOTS 32
+static std::mutex g_bank_lock;
+static bool g_bank_loaded;
+static std::string g_slot_chunk[NSLOTS], g_slot_name[NSLOTS], g_bank_path;
+
+/* Next to the plugin's own folder rather than inside it, so reinstalling the plugin folder
+ * doesn't take the presets with it; inside it if the parent can't be written. No dladdr
+ * (would need -ldl on the older glibc this is built against): /proc/self/maps has the path. */
+static std::string so_dir() {
+    std::string dir;
+    if (FILE *f = std::fopen("/proc/self/maps", "r")) {
+        char line[1024];
+        while (std::fgets(line, sizeof line, f)) {
+            char *p = std::strstr(line, "/acid.so");
+            char *start = std::strchr(line, '/');
+            if (!p || !start || start > p) continue;
+            dir.assign(start, (size_t)(p - start));
+            break;
+        }
+        std::fclose(f);
+    }
+    return dir;
+}
+static void bank_load_locked() {
+    if (g_bank_loaded) return;
+    g_bank_loaded = true;
+    std::string dir = so_dir(), cand[2];
+    if (dir.empty()) dir = "/tmp";
+    size_t cut = dir.rfind('/');
+    cand[0] = (cut != std::string::npos && cut > 0 ? dir.substr(0, cut) : dir) + "/acid_presets.txt";
+    cand[1] = dir + "/acid_presets.txt";
+    g_bank_path.clear();
+    for (const std::string &c : cand)             /* an existing file wins ... */
+        if (FILE *f = std::fopen(c.c_str(), "r")) { std::fclose(f); g_bank_path = c; break; }
+    for (int i = 0; i < 2 && g_bank_path.empty(); i++)   /* ... else the first place we may write */
+        if (FILE *f = std::fopen(cand[i].c_str(), "a")) { std::fclose(f); g_bank_path = cand[i]; }
+    if (g_bank_path.empty()) { LOG("[acid_vst] presets: no writable place near %s\n", dir.c_str()); return; }
+    int used = 0;
+    if (FILE *f = std::fopen(g_bank_path.c_str(), "r")) {
+        static char line[9000];
+        while (std::fgets(line, sizeof line, f)) {
+            line[std::strcspn(line, "\r\n")] = 0;
+            char *t1 = std::strchr(line, '\t');
+            char *t2 = t1 ? std::strchr(t1 + 1, '\t') : nullptr;
+            int idx = std::atoi(line);
+            if (!t2 || idx < 1 || idx > NSLOTS) continue;
+            *t1 = *t2 = 0;
+            g_slot_name[idx - 1] = t1 + 1;
+            g_slot_chunk[idx - 1] = t2 + 1;
+            used++;
+        }
+        std::fclose(f);
+    }
+    LOG("[acid_vst] presets: %s, %d of %d slots used\n", g_bank_path.c_str(), used, NSLOTS);
+}
+static bool bank_write_locked() {   /* whole file, via a temp file so a power cut can't leave half a bank */
+    if (g_bank_path.empty()) return false;
+    std::string tmp = g_bank_path + ".tmp";
+    FILE *f = std::fopen(tmp.c_str(), "w");
+    if (!f) { LOG("[acid_vst] presets: cannot write %s\n", tmp.c_str()); return false; }
+    for (int i = 0; i < NSLOTS; i++)
+        if (!g_slot_chunk[i].empty())
+            std::fprintf(f, "%d\t%s\t%s\n", i + 1, g_slot_name[i].c_str(), g_slot_chunk[i].c_str());
+    bool ok = std::fclose(f) == 0 && std::rename(tmp.c_str(), g_bank_path.c_str()) == 0;
+    if (!ok) LOG("[acid_vst] presets: write to %s failed\n", g_bank_path.c_str());
+    return ok;
+}
+static std::string slot_title(int i) {
+    std::lock_guard<std::mutex> lk(g_bank_lock);
+    char buf[32];
+    if (g_slot_chunk[i].empty()) { std::snprintf(buf, sizeof buf, "%02d (empty)", i + 1); return buf; }
+    if (!g_slot_name[i].empty()) return g_slot_name[i];
+    std::snprintf(buf, sizeof buf, "Acid %02d", i + 1);
+    return buf;
+}
 
 /* ---------------------------------------------------------------------------
  * Per-instance state
@@ -174,7 +264,9 @@ struct Plugin {
     int jump_logs = 0, param_logs = 0;   /* log budget, refilled with every 5 s stats line */
     snd_seq_t *seq = nullptr;
     int seq_port = -1;
-    char chunk[2048] = {0};
+    int cur = 0;                   /* selected preset slot, 0-based */
+    int slot = -1;                 /* ALSA port name slot: 0 = "Acid", 1 = "Acid 2", ... */
+    char chunk[8192] = {0};        /* params + both sequences (a_dice/b_dice, ~1.3 kB each) */
     /* diagnostics: per-callback timing, logged periodically and on slow callbacks */
     double t_max = 0, t_sum = 0, t_last_log = 0;
     long blocks = 0, slow = 0;
@@ -234,9 +326,18 @@ static float str_to_norm(const param_t *p, const char *s) {
     }
     return p->max > p->min ? clamp01((float)((std::atof(s) - p->min) / (p->max - p->min))) : 0.0f;
 }
+static int g_i_slot = -1, g_i_load = -1, g_i_save = -1;   /* wrapper-only params (module.json: slot/load/save) */
+static void find_preset_params() {
+    for (int i = 0; i < NPARAMS; i++) {
+        if (!std::strcmp(PARAMS[i].key, "slot")) g_i_slot = i;
+        else if (!std::strcmp(PARAMS[i].key, "load")) g_i_load = i;
+        else if (!std::strcmp(PARAMS[i].key, "save")) g_i_save = i;
+    }
+}
 static float get_norm(Plugin *w, int i) {
     char buf[64];
     int n;
+    if (i == g_i_slot) return (float)w->cur / (NSLOTS - 1);
     if (popup_is(i)) return w->open[i];
     if (PARAMS[i].momentary) return 0.0f;   /* triggers always read released, or the host echoes the press back */
     { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
@@ -252,7 +353,13 @@ static float get_norm(Plugin *w, int i) {
 static void alsa_open(Plugin *w) {
     if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_OUTPUT, SND_SEQ_NONBLOCK) < 0) { w->seq = nullptr; return; }
     snd_seq_set_client_pool_output(w->seq, 2048);   /* headroom so a slow subscriber never stalls the audio thread */
-    int n = g_instance_count.fetch_add(1);
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_slot_lock);
+        while (n < 31 && g_slot_used[n]) n++;
+        g_slot_used[n] = true;
+        w->slot = n;
+    }
     char name[32];
     if (n == 0) std::snprintf(name, sizeof name, "Acid");
     else std::snprintf(name, sizeof name, "Acid %d", n + 1);
@@ -304,6 +411,8 @@ static void alsa_close(Plugin *w) {
         }
     snd_seq_close(w->seq);
     w->seq = nullptr;
+    std::lock_guard<std::mutex> lk(g_slot_lock);
+    if (w->slot >= 0) { g_slot_used[w->slot] = false; w->slot = -1; }
 }
 
 /* ---------------------------------------------------------------------------
@@ -367,6 +476,58 @@ static void feed_transport(Plugin *w, int32_t frames) {
 }
 
 /* ---------------------------------------------------------------------------
+ * State as text: "key=value;" for every knob, then both sequences. Used for the
+ * project/preset chunk and for the preset slots alike.
+ * ------------------------------------------------------------------------- */
+static std::string build_state(Plugin *w) {
+    std::string s;
+    for (int i = 0; i < NPARAMS; i++) {
+        if (PARAMS[i].momentary || popup_is(i) || i == g_i_slot) continue;
+        char buf[32];
+        int n;
+        { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
+        if (n <= 0) continue;
+        buf[n < (int)sizeof buf ? n : (int)sizeof buf - 1] = 0;
+        s += PARAMS[i].key; s += '='; s += buf; s += ';';
+    }
+    /* the sequences themselves, after the knobs so they are restored last */
+    for (const char *key : {"a_dice", "b_dice"}) {
+        char big[2048];
+        int n;
+        { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, key, big, sizeof big); }
+        if (n > 0) { s += key; s += '='; s += big; s += ';'; }
+    }
+    return s;
+}
+static void apply_state(Plugin *w, std::string s, bool with_slot) {   /* by value: strtok_r cuts it up */
+    std::lock_guard<std::mutex> lk(w->lock);
+    char *save = nullptr;
+    for (char *tok = strtok_r(&s[0], ";", &save); tok; tok = strtok_r(nullptr, ";", &save)) {
+        char *eq = std::strchr(tok, '=');
+        if (!eq) continue;
+        *eq = 0;
+        if (!std::strcmp(tok, "prog")) {   /* which slot a project had selected; never loads the slot */
+            int v = std::atoi(eq + 1);
+            if (with_slot && v >= 0 && v < NSLOTS) w->cur = v;
+            continue;
+        }
+        g_api->set_param(w->inst, tok, eq + 1);
+    }
+}
+static void slot_load(Plugin *w) {
+    std::string c;
+    { std::lock_guard<std::mutex> lk(g_bank_lock); c = g_slot_chunk[w->cur]; }
+    LOG("[acid_vst] %p load preset %d (%zu bytes)\n", (void *)w, w->cur + 1, c.size());
+    if (!c.empty()) apply_state(w, c, false);   /* an empty slot leaves the current state alone */
+}
+static void slot_save(Plugin *w) {
+    std::string c = build_state(w);
+    bool ok;
+    { std::lock_guard<std::mutex> lk(g_bank_lock); g_slot_chunk[w->cur] = c; ok = bank_write_locked(); }
+    LOG("[acid_vst] %p save preset %d (%zu bytes) %s\n", (void *)w, w->cur + 1, c.size(), ok ? "ok" : "FAILED");
+}
+
+/* ---------------------------------------------------------------------------
  * VST callbacks
  * ------------------------------------------------------------------------- */
 static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
@@ -407,6 +568,22 @@ static void setParameter(AEffect *e, int32_t i, float n) {
         LOG("[acid_vst] %p setParameter %d (%s) = %.3f\n", (void *)w, i, p->key, n);
     }
     if (popup_set(w->open, i, n)) return;
+    if (i == g_i_slot) {   /* browsing only: LOAD loads, so turning the knob can't wipe what is playing */
+        int v = (int)std::lround(clamp01(n) * (NSLOTS - 1));
+        if (v != w->cur) { w->cur = v; w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f); }
+        return;
+    }
+    if (i == g_i_load || i == g_i_save) {
+        bool down = n > 0.5f;
+        bool rising = down && !w->held[i];
+        w->held[i] = down;
+        if (rising) {
+            if (i == g_i_load) slot_load(w); else slot_save(w);
+            w->release[i] = 1;
+            w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f);
+        }
+        return;
+    }
     if (p->momentary) {
         bool down = n > 0.5f;
         bool rising = down && !w->held[i];   /* an echo of our own automate must not re-fire the trigger */
@@ -455,6 +632,28 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         g_api->destroy_instance(w->inst);
         delete w;
         return 1;
+    case effSetProgram:
+        if (v >= 0 && v < NSLOTS) {
+            w->cur = (int)v;
+            slot_load(w);
+            w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f);
+        }
+        return 0;
+    case effGetProgram: return w->cur;
+    case effGetProgramName: copy_str(p, slot_title(w->cur), 24); return 0;
+    case effGetProgramNameIndexed:
+        if (idx < 0 || idx >= NSLOTS) return 0;
+        copy_str(p, slot_title(idx), 24);
+        return 1;
+    case effSetProgramName: {   /* only a used slot has a line in the file to carry the name */
+        std::lock_guard<std::mutex> lk(g_bank_lock);
+        if (!p || g_slot_chunk[w->cur].empty()) return 0;
+        std::string nm((const char *)p);
+        for (char &c : nm) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        g_slot_name[w->cur] = nm.substr(0, 23);
+        bank_write_locked();
+        return 0;
+    }
     case effGetPlugCategory: return 2; /* kPlugCategSynth */
     case effGetEffectName:
     case effGetProductString: copy_str(p, PLUG_NAME, 32); return 1;
@@ -472,6 +671,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         if (idx < 0 || idx >= NPARAMS) return 0;
         const param_t *pp = &PARAMS[idx];
         if (pp->momentary) { copy_str(p, "", 24); return 1; }
+        if (idx == g_i_slot) { copy_str(p, slot_title(w->cur), 24); return 1; }
         if (pp->nopts) {
             int k = (int)std::lround(get_norm(w, idx) * (pp->nopts - 1));
             copy_str(p, pp->opts[k], 24);
@@ -526,32 +726,21 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         return (!std::strcmp((char *)p, "receiveVstEvents") || !std::strcmp((char *)p, "receiveVstMidiEvent") ||
                 !std::strcmp((char *)p, "receiveVstTimeInfo")) ? 1 : -1;
     case effGetChunk: {
-        std::string s;
-        for (int i = 0; i < NPARAMS; i++) {
-            if (PARAMS[i].momentary || popup_is(i)) continue;
-            char buf[32];
-            int n;
-            { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
-            if (n <= 0) continue;
-            buf[n < (int)sizeof buf ? n : (int)sizeof buf - 1] = 0;
-            s += PARAMS[i].key; s += '='; s += buf; s += ';';
-        }
-        copy_str(w->chunk, s, sizeof w->chunk);
+        std::string st = build_state(w);
+        char prog[24];
+        std::snprintf(prog, sizeof prog, "prog=%d;", w->cur);
+        st += prog;
+        copy_str(w->chunk, st, sizeof w->chunk);
         *(void **)p = w->chunk;
+        LOG("[acid_vst] %p getChunk %zu bytes\n", (void *)w, std::strlen(w->chunk) + 1);
         return (intptr_t)std::strlen(w->chunk) + 1;
     }
     case effSetChunk: {
-        if (v <= 0 || (size_t)v > sizeof w->chunk) return 0;
-        std::memcpy(w->chunk, p, (size_t)v);
-        w->chunk[v - 1] = 0;
-        std::lock_guard<std::mutex> lk(w->lock);
-        char *s = w->chunk, *save = nullptr;
-        for (char *tok = strtok_r(s, ";", &save); tok; tok = strtok_r(nullptr, ";", &save)) {
-            char *eq = std::strchr(tok, '=');
-            if (!eq) continue;
-            *eq = 0;
-            g_api->set_param(w->inst, tok, eq + 1);
-        }
+        if (v <= 0 || (size_t)v >= sizeof w->chunk || !p) return 0;
+        LOG("[acid_vst] %p setChunk %ld bytes\n", (void *)w, (long)v);
+        std::string st((const char *)p, (size_t)v);
+        st.resize(std::strlen(st.c_str()));   /* stop at a NUL the host may have included */
+        apply_state(w, st, true);
         return 1;
     }
     default: return 0;
@@ -569,6 +758,11 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     }
     Plugin *w = new Plugin();
     w->master = master;
+    {
+        std::lock_guard<std::mutex> lk(g_bank_lock);
+        if (g_i_slot < 0) find_preset_params();
+        bank_load_locked();
+    }
     w->inst = g_api->create_instance(".", nullptr);
     if (!w->inst) { LOG("[acid_vst] create_instance failed\n"); delete w; return nullptr; }
     alsa_open(w);
@@ -581,6 +775,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     e->getParameter = getParameter;
     e->processReplacing = processReplacing;
     e->numParams = NPARAMS;
+    e->numPrograms = NSLOTS;
     e->numInputs = 0;
     e->numOutputs = 2;
     e->flags = effFlagsCanReplacing | effFlagsIsSynth | effFlagsProgramChunks;
