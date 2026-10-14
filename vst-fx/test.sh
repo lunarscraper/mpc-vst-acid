@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Offline x86 host test (ASan/UBSan) of the effect variant: run after build.sh (needs build/params.h
+# and build/popup.h). Same host_test.c as ../vst; it sees numInputs == 2 and additionally checks the
+# audio pass-through and the Effect category.
+set -euo pipefail
+cd "$(dirname "$0")"
+docker run --rm -v "$PWD/..":/w -w /w/vst-fx gcc:12 bash -euxc '
+  apt-get update -qq && apt-get install -y -qq libasound2-dev >/dev/null
+  mkdir -p /tmp/t
+  gcc -O0 -g -fsanitize=address,undefined -std=gnu11 -I../src -c ../src/acid_core.c -o /tmp/t/core.o
+  g++ -O0 -g -fsanitize=address,undefined -std=c++17 -I../src -Ibuild -c ../vst/acid_vst.cpp -o /tmp/t/vst.o
+  gcc -O0 -g -fsanitize=address,undefined -std=gnu11 -I../src -Ibuild -c ../vst/host_test.c -o /tmp/t/host_test.o
+  g++ -fsanitize=address,undefined -o /tmp/t/atest /tmp/t/core.o /tmp/t/vst.o /tmp/t/host_test.o -lasound -lpthread -lm
+  /tmp/t/atest
+'
+echo "PASSED"

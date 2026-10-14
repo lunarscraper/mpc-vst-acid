@@ -14,3 +14,12 @@ through the current Density/Accent/Slide/Octaves/Algo/Length/Scale values;
 (3) get_param/set_param "a_dice"/"b_dice": the sequence as text, for the
 project/preset chunk; re-vendor by diffing against force-acid's `src/` at a
 newer commit and copying over both files if the engine changes.
+(4) HOLD / SHIFT / VEL RAND per sequencer (set_param/get_param "hold", "shift", "velrand"), after the
+Spektro NGEN ACDGEN's Hold Prob / Shift / Random Vel but written from scratch: an 11th die per step
+(d_hold, its own PRNG stream so seeds still make the same patterns), dice string "D2" (still reads "D1",
+giving it HOLD dice from the saved seed), ties through rests in emit_step_for_seq(), diatonic shift in
+note_for_step(), VEL RAND on its own PRNG (vel_rng).
+(5) Merged sd88me/mpc-vst-acid master up to db89ddc (2026-10-11): Mute, random pattern on a new instance,
+"seed" get/set, and the song-position step path (0xF9 + "song_step"). The VST wrapper here keeps the
+fork's PpqClock fix (24-PPQN pulses by absolute ppq index, exact-once) and never sends 0xF9, so the core
+stays pulse-counted exactly as before; the song-position path is present but unused.

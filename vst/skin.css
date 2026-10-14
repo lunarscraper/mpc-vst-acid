@@ -23,3 +23,10 @@
 
 /* the acid_top.svg banner (title wordmark + smiley) sits on the panel colour, no extra chrome */
 .acid-wordmark { font-family: var(--acid-logo-font); }
+
+/* yellow backdrop: grain + wear come from images/bg_grain.svg; the charcoal panel stays as it was */
+.look-hticks line { stroke: #d9d4c4; }
+
+/* keycaps (GENERATE / MUTATE): raised bevel -- lit top edge, dark lower edge, glossy dome, deep contact shadow */
+.button-bg { fill: url(#key-linear); stroke: #4a0b04; stroke-width: 2; rx: 5; filter: drop-shadow(0 3px 0 #5a0d05) drop-shadow(0 5px 4px rgba(0,0,0,.6)); }
+.button-sheen { opacity: 1; rx: 5; fill: url(#key-gloss); }

@@ -18,7 +18,31 @@
  * MPC's transport is a single shared clock, so host_get_bpm/host_get_clock_status
  * (acid_core.h) stay process-wide globals same as host_shim.cpp's -- every
  * instance's process_midi/tick calls still go through its own acid_inst_t.
+ *
+ * TWO VARIANTS from this one file (params.h decides, see ../vst-fx/vst.json "effect": true):
+ *   Acid      instrument (IsSynth, 0 in / 2 out, writes silence) -> takes one of the 8 plugin
+ *             instrument slots; ALSA client "Acid", "Acid 2", ...
+ *   Acid FX   insert effect (PLUG_EFFECT: 2 in / 2 out, audio passed through untouched, category
+ *             Effect, own UID, own .so, own ALSA client "Acid FX", "Acid FX 2", ...) -> takes NO
+ *             instrument slot; put it as an insert on any track, or on the master.
+ * Both use the same preset file (acid_presets.txt next to the plugin folders) and read it again
+ * before every LOAD/SAVE, so a slot saved in one variant loads in the other.
+ *
+ * CONTROL BY MIDI (both variants): each Acid client also has a port "Control In" that subscribes
+ * itself to every hardware MIDI input (also ones plugged in later) and that a MIDI track can pick as
+ * its output port. Only messages on the channel set with "Control Ch" (OFF, 1..16; default 16; saved
+ * with the project, not in preset slots) are used, so several Acids can share one controller:
+ *   note on            live transpose relative to C4 (as notes into the instrument's track)
+ *   CC base+k, base = 20 for SEQ A, 40 for SEQ B, k =
+ *                      0 generate, 1 mutate, 2 density, 3 accent, 4 slide, 5 octaves, 6 algo,
+ *                      7 length, 8 gate, 9 offset, 10 dir, 11 regen, 12 midi ch, 13 hold,
+ *                      14 shift, 15 vel rand;  CC 56 = B tune offset
+ *   CC 70..78          scale, root, swing, jitter, reset all, blend mode, blend a>b, cv mode, mute
+ *   CC 100..102        preset slot, load, save
+ * Triggers (generate, mutate, load, save) fire when the value rises past 64. 0..127 is spread over
+ * the parameter's range; selectors pick their option directly.
  * ========================================================================== */
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -28,13 +52,23 @@
 #include <mutex>
 #include <string>
 
+#ifndef NO_ALSA
 #include <alsa/asoundlib.h>
+#endif
 
 extern "C" {
 #include "acid_core.h"
 }
 #include "params.h"
 #include "popup.h"    /* mpc-vst-plugins wrapper/popup.h, copied into build/ by build.sh */
+
+#ifdef PLUG_EFFECT
+#define SO_FILE  "/acid_fx.so"
+#define LOG_FILE "/tmp/acid_fx_vst.log"
+#else
+#define SO_FILE  "/acid.so"
+#define LOG_FILE "/tmp/acid_vst.log"
+#endif
 
 /* ---- VST2 ABI (hand-written; no Steinberg SDK) ---------------------------- */
 struct AEffect;
@@ -160,7 +194,7 @@ static inline bool ppq_clock_block(PpqClock *c, double ppq, double tempo, double
     return true;
 }
 
-#define BUILD_ID "presets32-2026-10-03"
+#define BUILD_ID "fx-ccin-hold-2026-10-11"
 
 /* ---------------------------------------------------------------------------
  * Preset bank: NSLOTS slots shared by every Acid instance and every project,
@@ -184,7 +218,7 @@ static std::string so_dir() {
     if (FILE *f = std::fopen("/proc/self/maps", "r")) {
         char line[1024];
         while (std::fgets(line, sizeof line, f)) {
-            char *p = std::strstr(line, "/acid.so");
+            char *p = std::strstr(line, SO_FILE);
             char *start = std::strchr(line, '/');
             if (!p || !start || start > p) continue;
             dir.assign(start, (size_t)(p - start));
@@ -226,6 +260,13 @@ static void bank_load_locked() {
     }
     LOG("[acid_vst] presets: %s, %d of %d slots used\n", g_bank_path.c_str(), used, NSLOTS);
 }
+/* The other variant (Acid <-> Acid FX) is a separate .so with its own copy of the bank in memory but
+ * the same file: read it again before a LOAD or SAVE so neither overwrites what the other saved. */
+static void bank_reload_locked() {
+    for (int i = 0; i < NSLOTS; i++) { g_slot_chunk[i].clear(); g_slot_name[i].clear(); }
+    g_bank_loaded = false;
+    bank_load_locked();
+}
 static bool bank_write_locked() {   /* whole file, via a temp file so a power cut can't leave half a bank */
     if (g_bank_path.empty()) return false;
     std::string tmp = g_bank_path + ".tmp";
@@ -260,10 +301,18 @@ struct Plugin {
     float open[NPARAMS] = {0};     /* popup "open" flags (popup.h): wrapper-only, not saved */
     double last_ppq = 0.0;
     bool was_playing = false;
-    PpqClock clk;
+    PpqClock clk;                  /* lunarscraper clock fix: pulses by absolute ppq index (see PpqClock) */
     int jump_logs = 0, param_logs = 0;   /* log budget, refilled with every 5 s stats line */
+    long pulses_fed = 0;   /* 24-PPQN pulses fed to the core since the instance was made (host_test only) */
+#ifndef NO_ALSA
     snd_seq_t *seq = nullptr;
+#endif
     int seq_port = -1;
+    int ctl_port = -1;             /* "Control In": notes/CCs from controllers and MIDI tracks */
+    int cc_ch = 16;                /* Control Ch: 0 = OFF, 1..16 (wrapper-only, saved in the project chunk) */
+    bool cc_high[128] = {false};   /* trigger CCs: value was >= 64 last time (fire on the rising edge only) */
+    long cc_seen = 0, cc_used = 0; /* diagnostics, 5 s log line */
+    long dbg_sent = 0, dbg_noteons = 0; int dbg_vel_min = 127, dbg_vel_max = 0;   /* NO_ALSA test build only */
     int cur = 0;                   /* selected preset slot, 0-based */
     int slot = -1;                 /* ALSA port name slot: 0 = "Acid", 1 = "Acid 2", ... */
     char chunk[8192] = {0};        /* params + both sequences (a_dice/b_dice, ~1.3 kB each) */
@@ -327,17 +376,25 @@ static float str_to_norm(const param_t *p, const char *s) {
     return p->max > p->min ? clamp01((float)((std::atof(s) - p->min) / (p->max - p->min))) : 0.0f;
 }
 static int g_i_slot = -1, g_i_load = -1, g_i_save = -1;   /* wrapper-only params (module.json: slot/load/save) */
+static int g_i_cc = -1, g_i_mute = -1;                     /* wrapper-only cc_ch; mute (not saved in slots) */
 static void find_preset_params() {
     for (int i = 0; i < NPARAMS; i++) {
         if (!std::strcmp(PARAMS[i].key, "slot")) g_i_slot = i;
         else if (!std::strcmp(PARAMS[i].key, "load")) g_i_load = i;
         else if (!std::strcmp(PARAMS[i].key, "save")) g_i_save = i;
+        else if (!std::strcmp(PARAMS[i].key, "cc_ch")) g_i_cc = i;
+        else if (!std::strcmp(PARAMS[i].key, "mute")) g_i_mute = i;
     }
+}
+static int param_index(const char *key) {
+    for (int i = 0; i < NPARAMS; i++) if (!std::strcmp(PARAMS[i].key, key)) return i;
+    return -1;
 }
 static float get_norm(Plugin *w, int i) {
     char buf[64];
     int n;
     if (i == g_i_slot) return (float)w->cur / (NSLOTS - 1);
+    if (i == g_i_cc) return PARAMS[i].nopts > 1 ? (float)w->cc_ch / (PARAMS[i].nopts - 1) : 0.0f;
     if (popup_is(i)) return w->open[i];
     if (PARAMS[i].momentary) return 0.0f;   /* triggers always read released, or the host echoes the press back */
     { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
@@ -350,26 +407,20 @@ static float get_norm(Plugin *w, int i) {
  * as poc/midiport.c verified. MPC hot-detects the port with no restart; the
  * user routes a track's MIDI input from it, one per Acid instance.
  * ------------------------------------------------------------------------- */
-static void alsa_open(Plugin *w) {
-    if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_OUTPUT, SND_SEQ_NONBLOCK) < 0) { w->seq = nullptr; return; }
-    snd_seq_set_client_pool_output(w->seq, 2048);   /* headroom so a slow subscriber never stalls the audio thread */
+/* Lowest free port-name slot: 0 = "Acid" / "Acid FX", 1 = "... 2", ... (given back on close) */
+static int slot_take(Plugin *w) {
+    std::lock_guard<std::mutex> lk(g_slot_lock);
     int n = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_slot_lock);
-        while (n < 31 && g_slot_used[n]) n++;
-        g_slot_used[n] = true;
-        w->slot = n;
-    }
-    char name[32];
-    if (n == 0) std::snprintf(name, sizeof name, "Acid");
-    else std::snprintf(name, sizeof name, "Acid %d", n + 1);
-    snd_seq_set_client_name(w->seq, name);
-    w->seq_port = snd_seq_create_simple_port(w->seq, "MIDI Out",
-        SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
-        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
-    LOG("[acid_vst] ALSA client '%s' port %d\n", name, w->seq_port);
+    while (n < 31 && g_slot_used[n]) n++;
+    g_slot_used[n] = true;
+    w->slot = n;
+    return n;
 }
-static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int n) {
+static void slot_give(Plugin *w) {
+    std::lock_guard<std::mutex> lk(g_slot_lock);
+    if (w->slot >= 0) { g_slot_used[w->slot] = false; w->slot = -1; }
+}
+static void sent_remember(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int n) {
     for (int i = 0; i < n; i++) {
         if (lens[i] < 2) continue;
         w->sent_ring[w->sent_pos][0] = msgs[i][0];
@@ -378,11 +429,97 @@ static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int 
         w->sent_pos = (w->sent_pos + 1) % 16;
         if (w->sent_len < 16) w->sent_len++;
     }
+}
+static bool is_muted(Plugin *w) {
+    char mb[8] = {0};
+    { std::lock_guard<std::mutex> lk(w->lock); g_api->get_param(w->inst, "mute", mb, sizeof mb); }
+    return std::atoi(mb) != 0;   /* muted: swallow note-ons, keep note-offs so nothing hangs */
+}
+static void control_in(Plugin *w, uint8_t status, uint8_t d1, uint8_t d2);   /* below */
+
+#ifndef NO_ALSA
+/* Subscribe Control In to one hardware MIDI input (a USB controller, the DIN input) -- the same
+ * rule Euclidier uses: readable, exported, HARDWARE type (so not other plugins' virtual ports). */
+static void ctl_subscribe(Plugin *w, int client, int port) {
+    if (client == snd_seq_client_id(w->seq) || client == SND_SEQ_CLIENT_SYSTEM) return;
+    snd_seq_port_info_t *pi;
+    snd_seq_port_info_alloca(&pi);
+    if (snd_seq_get_any_port_info(w->seq, client, port, pi) < 0) return;
+    unsigned cap = snd_seq_port_info_get_capability(pi), type = snd_seq_port_info_get_type(pi);
+    if ((cap & (SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ)) != (SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ)) return;
+    if (cap & SND_SEQ_PORT_CAP_NO_EXPORT) return;
+    if (!(type & SND_SEQ_PORT_TYPE_HARDWARE)) return;
+    int rc = snd_seq_connect_from(w->seq, w->ctl_port, client, port);
+    LOG("[acid_vst] control in <- %d:%d '%s'%s\n", client, port, snd_seq_port_info_get_name(pi),
+        rc < 0 ? " (already connected or refused)" : "");
+}
+static void ctl_subscribe_all(Plugin *w) {
+    snd_seq_client_info_t *ci;
+    snd_seq_port_info_t *pi;
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_client_info_set_client(ci, -1);
+    while (snd_seq_query_next_client(w->seq, ci) >= 0) {
+        int c = snd_seq_client_info_get_client(ci);
+        snd_seq_port_info_set_client(pi, c);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(w->seq, pi) >= 0) ctl_subscribe(w, c, snd_seq_port_info_get_port(pi));
+    }
+}
+static void alsa_open(Plugin *w) {
+    if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK) < 0) {
+        w->seq = nullptr; LOG("[acid_vst] snd_seq_open failed\n"); return;
+    }
+    snd_seq_set_client_pool_output(w->seq, 2048);   /* headroom so a slow subscriber never stalls the audio thread */
+    int n = slot_take(w);
+    char name[32];
+    if (n == 0) std::snprintf(name, sizeof name, "%s", PLUG_NAME);
+    else std::snprintf(name, sizeof name, "%s %d", PLUG_NAME, n + 1);
+    snd_seq_set_client_name(w->seq, name);
+    w->seq_port = snd_seq_create_simple_port(w->seq, "MIDI Out",
+        SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
+        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    w->ctl_port = snd_seq_create_simple_port(w->seq, "Control In",
+        SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
+        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    LOG("[acid_vst] ALSA client '%s' (%d) out port %d, control in port %d\n", name, snd_seq_client_id(w->seq),
+        w->seq_port, w->ctl_port);
+    if (w->ctl_port < 0) return;
+    /* hot-plug: the system announce port reports ports that appear later */
+    snd_seq_connect_from(w->seq, w->ctl_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
+    ctl_subscribe_all(w);
+}
+/* audio thread: drain Control In (non-blocking, bounded) */
+static void alsa_poll(Plugin *w) {
+    if (!w->seq || w->ctl_port < 0) return;
+    snd_seq_event_t *ev = nullptr;
+    for (int guard = 0; guard < 256 && snd_seq_event_input_pending(w->seq, 1) > 0; guard++) {
+        if (snd_seq_event_input(w->seq, &ev) < 0 || !ev) break;
+        switch (ev->type) {
+        case SND_SEQ_EVENT_CONTROLLER:
+            control_in(w, (uint8_t)(0xB0 | (ev->data.control.channel & 0x0F)), (uint8_t)(ev->data.control.param & 0x7F),
+                       (uint8_t)(ev->data.control.value < 0 ? 0 : ev->data.control.value > 127 ? 127 : ev->data.control.value));
+            break;
+        case SND_SEQ_EVENT_NOTEON:
+            control_in(w, (uint8_t)(0x90 | (ev->data.note.channel & 0x0F)), ev->data.note.note & 0x7F, ev->data.note.velocity & 0x7F);
+            break;
+        case SND_SEQ_EVENT_PORT_START:
+            ctl_subscribe(w, ev->data.addr.client, ev->data.addr.port);
+            break;
+        default: break;
+        }
+    }
+}
+static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int n) {
+    if (n <= 0) return;
+    sent_remember(w, msgs, lens, n);
     if (!w->seq || w->seq_port < 0) return;
+    bool muted = is_muted(w);
     for (int i = 0; i < n; i++) {
         const uint8_t *m = msgs[i];
         int len = lens[i];
         if (len < 2) continue;
+        if (muted && (m[0] & 0xF0) == 0x90 && len >= 3 && m[2] > 0) continue;
         snd_seq_event_t ev;
         snd_seq_ev_clear(&ev);
         snd_seq_ev_set_source(&ev, w->seq_port);
@@ -398,22 +535,45 @@ static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int 
     snd_seq_drain_output(w->seq);
 }
 static void alsa_close(Plugin *w) {
-    if (!w->seq) return;
-    for (int ch = 0; ch < 16; ch++)
-        for (int note = 0; note < 128; note++) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_source(&ev, w->seq_port);
-            snd_seq_ev_set_subs(&ev);
-            snd_seq_ev_set_direct(&ev);
-            snd_seq_ev_set_noteoff(&ev, ch, note, 0);
-            snd_seq_event_output_direct(w->seq, &ev);
-        }
-    snd_seq_close(w->seq);
-    w->seq = nullptr;
-    std::lock_guard<std::mutex> lk(g_slot_lock);
-    if (w->slot >= 0) { g_slot_used[w->slot] = false; w->slot = -1; }
+    if (w->seq) {
+        for (int ch = 0; ch < 16; ch++)
+            for (int note = 0; note < 128; note++) {
+                snd_seq_event_t ev;
+                snd_seq_ev_clear(&ev);
+                snd_seq_ev_set_source(&ev, w->seq_port);
+                snd_seq_ev_set_subs(&ev);
+                snd_seq_ev_set_direct(&ev);
+                snd_seq_ev_set_noteoff(&ev, ch, note, 0);
+                snd_seq_event_output_direct(w->seq, &ev);
+            }
+        snd_seq_close(w->seq);
+        w->seq = nullptr;
+    }
+    slot_give(w);
 }
+#else
+/* Offline test build (host_test.c): no ALSA. ACID_TRACE=1 prints every outgoing message. */
+static void alsa_open(Plugin *w) { slot_take(w); }
+static void alsa_poll(Plugin *) {}
+static void alsa_send(Plugin *w, const uint8_t (*msgs)[3], const int *lens, int n) {
+    if (n <= 0) return;
+    sent_remember(w, msgs, lens, n);
+    static int trace = std::getenv("ACID_TRACE") ? 1 : 0;
+    bool muted = is_muted(w);
+    for (int i = 0; i < n; i++) {
+        if (lens[i] < 2) continue;
+        if (muted && (msgs[i][0] & 0xF0) == 0x90 && lens[i] >= 3 && msgs[i][2] > 0) continue;
+        w->dbg_sent++;
+        if ((msgs[i][0] & 0xF0) == 0x90 && lens[i] >= 3 && msgs[i][2] > 0) {
+            w->dbg_noteons++;
+            if (msgs[i][2] < w->dbg_vel_min) w->dbg_vel_min = msgs[i][2];
+            if (msgs[i][2] > w->dbg_vel_max) w->dbg_vel_max = msgs[i][2];
+        }
+        if (trace) std::printf("MIDI %02x %02x %02x\n", msgs[i][0], msgs[i][1], lens[i] > 2 ? msgs[i][2] : 0);
+    }
+}
+static void alsa_close(Plugin *w) { slot_give(w); }
+#endif
 
 /* ---------------------------------------------------------------------------
  * Transport / clock synthesis: audioMasterGetTime -> synthetic 24-PPQN clock,
@@ -466,6 +626,7 @@ static void feed_transport(Plugin *w, int32_t frames) {
             int n;
             { std::lock_guard<std::mutex> lk(w->lock); n = g_api->process_midi(w->inst, msg, 1, out, olen, MIDI_FX_MAX_OUT_MSGS); }
             alsa_send(w, out, olen, n);
+            w->pulses_fed++;
         }
         w->last_ppq = ti->ppqPos;
     }
@@ -475,14 +636,38 @@ static void feed_transport(Plugin *w, int32_t frames) {
     alsa_send(w, out, olen, n);
 }
 
+/* test hook (host_test.c): 16th-note step boundaries sent to the core; hidden in the release build */
+extern "C" long acid_dbg_pulses(AEffect *e) { return ((Plugin *)e->object)->pulses_fed; }
+extern "C" float acid_dbg_bpm(void) { return g_bpm.load(); }
+extern "C" long acid_dbg_noteons(AEffect *e) { return ((Plugin *)e->object)->dbg_noteons; }
+extern "C" int acid_dbg_vel_span(AEffect *e) { Plugin *w = (Plugin *)e->object; return w->dbg_vel_max - w->dbg_vel_min; }
+extern "C" void acid_dbg_vel_reset(AEffect *e) { Plugin *w = (Plugin *)e->object; w->dbg_vel_min = 127; w->dbg_vel_max = 0; w->dbg_noteons = 0; }
+extern "C" void acid_dbg_control(AEffect *e, int status, int d1, int d2) {   /* as if it came in on Control In */
+    control_in((Plugin *)e->object, (uint8_t)status, (uint8_t)d1, (uint8_t)d2);
+}
+extern "C" int acid_dbg_pos(AEffect *e) {
+    char b[16] = {0};
+    Plugin *w = (Plugin *)e->object;
+    std::lock_guard<std::mutex> lk(w->lock);
+    g_api->get_param(w->inst, "a_pos", b, sizeof b);
+    return std::atoi(b);
+}
+
 /* ---------------------------------------------------------------------------
  * State as text: "key=value;" for every knob, then both sequences. Used for the
  * project/preset chunk and for the preset slots alike.
  * ------------------------------------------------------------------------- */
-static std::string build_state(Plugin *w) {
+/* for_slot: a preset slot holds the sound (knobs + sequences) but not MUTE or Control Ch, which belong
+ * to the project and the controller setup -- loading a slot must not mute Acid or deafen it to CCs. */
+static std::string build_state(Plugin *w, bool for_slot) {
     std::string s;
     for (int i = 0; i < NPARAMS; i++) {
         if (PARAMS[i].momentary || popup_is(i) || i == g_i_slot) continue;
+        if (i == g_i_cc) {
+            if (!for_slot) { s += "cc_ch="; s += std::to_string(w->cc_ch); s += ';'; }
+            continue;
+        }
+        if (for_slot && i == g_i_mute) continue;
         char buf[32];
         int n;
         { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
@@ -511,33 +696,109 @@ static void apply_state(Plugin *w, std::string s, bool with_slot) {   /* by valu
             if (with_slot && v >= 0 && v < NSLOTS) w->cur = v;
             continue;
         }
+        if (!std::strcmp(tok, "cc_ch")) {   /* wrapper-only; slots never carry it (see build_state) */
+            int v = std::atoi(eq + 1);
+            if (v >= 0 && v <= 16) w->cc_ch = v;
+            continue;
+        }
         g_api->set_param(w->inst, tok, eq + 1);
     }
 }
+/* Knobs added after the first presets/projects were saved: a state without them gets their defaults
+ * (put first, so a state that has them overrides), not whatever the last sound had. */
+static const char *const NEW_KNOB_DEFAULTS = "a_hold=0;a_shift=0;a_velrand=0;b_hold=0;b_shift=0;b_velrand=0;";
 static void slot_load(Plugin *w) {
     std::string c;
-    { std::lock_guard<std::mutex> lk(g_bank_lock); c = g_slot_chunk[w->cur]; }
+    { std::lock_guard<std::mutex> lk(g_bank_lock); bank_reload_locked(); c = g_slot_chunk[w->cur]; }
     LOG("[acid_vst] %p load preset %d (%zu bytes)\n", (void *)w, w->cur + 1, c.size());
-    if (!c.empty()) apply_state(w, c, false);   /* an empty slot leaves the current state alone */
+    if (!c.empty()) apply_state(w, NEW_KNOB_DEFAULTS + c, false);   /* an empty slot leaves the current state alone */
 }
 static void slot_save(Plugin *w) {
-    std::string c = build_state(w);
+    std::string c = build_state(w, true);
     bool ok;
-    { std::lock_guard<std::mutex> lk(g_bank_lock); g_slot_chunk[w->cur] = c; ok = bank_write_locked(); }
+    { std::lock_guard<std::mutex> lk(g_bank_lock); bank_reload_locked(); g_slot_chunk[w->cur] = c; ok = bank_write_locked(); }
     LOG("[acid_vst] %p save preset %d (%zu bytes) %s\n", (void *)w, w->cur + 1, c.size(), ok ? "ok" : "FAILED");
+}
+
+/* ---------------------------------------------------------------------------
+ * Control by MIDI (see the header): Control In port, and CCs/notes the host
+ * hands the plugin as VST events. Audio thread; takes w->lock per core call.
+ * ------------------------------------------------------------------------- */
+static const char *cc_key(int cc, char *buf, size_t max) {
+    static const char *const SEQ[16] = {"generate", "mutate", "density", "accent", "slide", "octaves", "algo",
+                                        "length", "gate", "offset", "dir", "auto_gen", "channel", "hold", "shift", "velrand"};
+    static const char *const GLOB[9] = {"scale", "root", "swing", "jitter", "reset_bars", "blend_mode", "blend", "cv_mode", "mute"};
+    static const char *const PRE[3] = {"slot", "load", "save"};
+    if (cc >= 20 && cc <= 35) { std::snprintf(buf, max, "a_%s", SEQ[cc - 20]); return buf; }
+    if (cc >= 40 && cc <= 55) { std::snprintf(buf, max, "b_%s", SEQ[cc - 40]); return buf; }
+    if (cc == 56) return "b_tune";
+    if (cc >= 70 && cc <= 78) return GLOB[cc - 70];
+    if (cc >= 100 && cc <= 102) return PRE[cc - 100];
+    return nullptr;
+}
+static void control_in(Plugin *w, uint8_t status, uint8_t d1, uint8_t d2) {
+    uint8_t type = status & 0xF0, ch = status & 0x0F;
+    if (type == 0xB0) w->cc_seen++;
+    if (w->cc_ch == 0 || ch != w->cc_ch - 1) return;
+    if (type == 0x90 && d2 > 0) {   /* live transpose, exactly as a note into the instrument's track */
+        uint8_t m[3] = {status, d1, d2};
+        if (was_just_sent(w, m)) return;   /* our own output routed back in: not a transpose */
+        uint8_t out[MIDI_FX_MAX_OUT_MSGS][3];
+        int olen[MIDI_FX_MAX_OUT_MSGS], n;
+        { std::lock_guard<std::mutex> lk(w->lock); n = g_api->process_midi(w->inst, m, 3, out, olen, MIDI_FX_MAX_OUT_MSGS); }
+        alsa_send(w, out, olen, n);
+        return;
+    }
+    if (type != 0xB0) return;
+    char kb[24];
+    const char *key = cc_key(d1, kb, sizeof kb);
+    int i = key ? param_index(key) : -1;
+    if (i < 0) return;
+    w->cc_used++;
+    const param_t *p = &PARAMS[i];
+    bool high = d2 >= 64, rising = high && !w->cc_high[d1];
+    w->cc_high[d1] = high;
+    if (i == g_i_load || i == g_i_save) {
+        if (rising) { if (i == g_i_load) slot_load(w); else slot_save(w); w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f); }
+        return;
+    }
+    if (p->momentary) {
+        if (rising) { std::lock_guard<std::mutex> lk(w->lock); g_api->set_param(w->inst, p->key, "go"); }
+        return;
+    }
+    float norm = d2 / 127.0f;
+    if (p->nopts > 1) norm = (float)std::lround(norm * (p->nopts - 1)) / (p->nopts - 1);   /* an exact option */
+    if (i == g_i_slot) {
+        w->cur = (int)std::lround(norm * (NSLOTS - 1));
+    } else {
+        char buf[32];
+        norm_to_str(p, norm, buf, sizeof buf);
+        std::lock_guard<std::mutex> lk(w->lock);
+        g_api->set_param(w->inst, p->key, buf);
+    }
+    w->master(&w->fx, audioMasterAutomate, i, 0, 0, norm);   /* the skin's knob follows */
 }
 
 /* ---------------------------------------------------------------------------
  * VST callbacks
  * ------------------------------------------------------------------------- */
 static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
-    (void)in;
     Plugin *w = (Plugin *)e->object;
     double t0 = now_ms();
+#ifdef PLUG_EFFECT
+    /* insert effect: the track's audio goes through untouched (the host may hand us in == out) */
+    for (int ch = 0; ch < 2; ch++) {
+        if (in && in[ch]) { if (out[ch] != in[ch]) std::memmove(out[ch], in[ch], (size_t)n * sizeof(float)); }
+        else std::memset(out[ch], 0, (size_t)n * sizeof(float));
+    }
+#else
+    (void)in;
+    for (int32_t i = 0; i < n; i++) out[0][i] = out[1][i] = 0.0f;   /* MIDI generator: no audio */
+#endif
+    alsa_poll(w);   /* Control In first, so a transpose or knob move lands on this block's steps */
     feed_transport(w, n);
     for (int i = 0; i < NPARAMS; i++)
         if (w->release[i]) { w->release[i] = 0; w->held[i] = false; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
-    for (int32_t i = 0; i < n; i++) out[0][i] = out[1][i] = 0.0f;   /* MIDI generator: no audio */
 
     double t1 = now_ms(), dt = t1 - t0;
     w->blocks++; w->t_sum += dt;
@@ -548,12 +809,15 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     if (t1 - w->t_last_log > 5000.0) {
         if (w->t_last_log > 0)
             LOG("[acid_vst] %ld blocks, size %d..%d, avg %.3f ms, max %.2f ms, slow %ld, playing %d, ppq %.3f, bpm %.2f"
-                " | clock: %ld pulses, %ld caught up, %ld overlapped, %ld jumps\n",
+                " | clock: %ld pulses, %ld caught up, %ld overlapped, %ld jumps"
+                " | control ch %d: %ld cc seen, %ld used\n",
                 w->blocks, w->block_min, w->block_max, w->t_sum / w->blocks, w->t_max, w->slow,
                 (int)w->was_playing, w->last_ppq, g_bpm.load(),
-                w->clk.pulses, w->clk.gaps, w->clk.dups, w->clk.jumps);
+                w->clk.pulses, w->clk.gaps, w->clk.dups, w->clk.jumps,
+                w->cc_ch, w->cc_seen, w->cc_used);
         w->clk.pulses = w->clk.gaps = w->clk.dups = w->clk.jumps = 0;
         w->jump_logs = w->param_logs = 0;
+        w->cc_seen = w->cc_used = 0;
         w->t_last_log = t1; w->t_max = w->t_sum = 0; w->blocks = w->slow = 0;
         w->block_min = 1 << 30; w->block_max = 0;
     }
@@ -611,6 +875,10 @@ static void setParameter(AEffect *e, int32_t i, float n) {
             nudge = true;
         }
     }
+    if (i == g_i_cc) {   /* Control Ch: wrapper only, the core doesn't know the key */
+        w->cc_ch = (int)std::lround(clamp01(n) * (p->nopts - 1));
+        return;
+    }
     norm_to_str(p, n, buf, sizeof buf);
     {
         std::lock_guard<std::mutex> lk(w->lock);
@@ -654,7 +922,11 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         bank_write_locked();
         return 0;
     }
+#ifdef PLUG_EFFECT
+    case effGetPlugCategory: return 1; /* kPlugCategEffect */
+#else
     case effGetPlugCategory: return 2; /* kPlugCategSynth */
+#endif
     case effGetEffectName:
     case effGetProductString: copy_str(p, PLUG_NAME, 32); return 1;
     case effGetVendorString: copy_str(p, PLUG_VENDOR, 32); return 1;
@@ -715,6 +987,11 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
              * a human keypress almost never lands on Acid's own fixed
              * generator velocities (72/118 normal, 1/127 CV mode). */
             if (was_just_sent(w, m->midiData)) continue;
+            /* a CC on the Control Ch steers Acid like one from the Control In port */
+            if ((m->midiData[0] & 0xF0) == 0xB0 && w->cc_ch > 0 && (m->midiData[0] & 0x0F) == w->cc_ch - 1) {
+                control_in(w, m->midiData[0], m->midiData[1] & 0x7F, m->midiData[2] & 0x7F);
+                continue;
+            }
             int n;
             { std::lock_guard<std::mutex> lk(w->lock);
               n = g_api->process_midi(w->inst, m->midiData, 3, out, olen, MIDI_FX_MAX_OUT_MSGS); }
@@ -726,7 +1003,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         return (!std::strcmp((char *)p, "receiveVstEvents") || !std::strcmp((char *)p, "receiveVstMidiEvent") ||
                 !std::strcmp((char *)p, "receiveVstTimeInfo")) ? 1 : -1;
     case effGetChunk: {
-        std::string st = build_state(w);
+        std::string st = build_state(w, false);
         char prog[24];
         std::snprintf(prog, sizeof prog, "prog=%d;", w->cur);
         st += prog;
@@ -740,7 +1017,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         LOG("[acid_vst] %p setChunk %ld bytes\n", (void *)w, (long)v);
         std::string st((const char *)p, (size_t)v);
         st.resize(std::strlen(st.c_str()));   /* stop at a NUL the host may have included */
-        apply_state(w, st, true);
+        apply_state(w, NEW_KNOB_DEFAULTS + st, true);
         return 1;
     }
     default: return 0;
@@ -748,7 +1025,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
 }
 
 extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMasterCallback master) {
-    if (!g_log) g_log = std::fopen("/tmp/acid_vst.log", "a");
+    if (!g_log) g_log = std::fopen(LOG_FILE, "a");
     {
         std::lock_guard<std::mutex> lk(g_api_init_lock);
         if (!g_api) {
@@ -776,9 +1053,15 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     e->processReplacing = processReplacing;
     e->numParams = NPARAMS;
     e->numPrograms = NSLOTS;
+#ifdef PLUG_EFFECT
+    e->numInputs = 2;
+    e->numOutputs = 2;
+    e->flags = effFlagsCanReplacing | effFlagsProgramChunks;
+#else
     e->numInputs = 0;
     e->numOutputs = 2;
     e->flags = effFlagsCanReplacing | effFlagsIsSynth | effFlagsProgramChunks;
+#endif
     e->uniqueID = PLUG_UID;
     e->version = PLUG_VERSION;
     e->object = w;

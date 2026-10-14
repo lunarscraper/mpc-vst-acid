@@ -18,7 +18,8 @@ mkdir -p build
 docker build -q -t mpc-vst-html-art "$MPC_VST/tools/html_art" >/dev/null
 
 # 2. params.h, skin, pluginlist-entry.xml
-docker run --rm -u "$U" -e HOME=/tmp -v "$PWD":/w -v "$MPC_VST":/mv:ro -w /w mpc-vst-html-art \
+# SHADOW_SKIN_MPC_OS=2 (set by the release workflow) writes the skin in the MPC OS 2.x shape
+docker run --rm -u "$U" -e HOME=/tmp ${SHADOW_SKIN_MPC_OS:+-e SHADOW_SKIN_MPC_OS="$SHADOW_SKIN_MPC_OS"} -v "$PWD":/w -v "$MPC_VST":/mv:ro -w /w mpc-vst-html-art \
   python3 /mv/tools/gen_vst.py vst.json
 
 cp "$MPC_VST/wrapper/popup.h" build/   # popup open-flag handling shared with mpc-vst's own wrapper
@@ -31,7 +32,7 @@ docker run --rm --platform linux/arm/v7 -v "$PWD/..":/b -w /b/vst arm32v7/gcc:11
   g++ -O2 -fPIC -fvisibility=hidden -std=c++17 -Wall -Wextra -Wno-unused-parameter \
       -I../src -Ibuild -c acid_vst.cpp -o build/obj/vst.o
   g++ -shared -o build/acid.so build/obj/core.o build/obj/vst.o \
-      -static-libstdc++ -static-libgcc -lasound -lpthread -lm
+      -static-libstdc++ -static-libgcc -lasound -lpthread -lm -Wl,--no-undefined
   strip build/acid.so
   echo "-- exported --"; readelf --dyn-syms -W build/acid.so | grep -E " GLOBAL .* [0-9]+ [A-Za-z]" | grep -v UND
   echo "-- needed --"; readelf -d build/acid.so | grep NEEDED

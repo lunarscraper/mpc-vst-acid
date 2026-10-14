@@ -1,5 +1,5 @@
 {
-  "_comment": "Not a real Schwung module -- chain_params here transcribes host_shim.cpp's PARAMS[] table verbatim (same order, same CC-MAP.md ranges) so tools/gen_vst.py can generate params.h + the skin for the VST port. Keep in sync by hand with host_shim.cpp and docs/CC-MAP.md.",
+  "_comment": "Not a real Schwung module -- chain_params here transcribes host_shim.cpp's PARAMS[] table verbatim (same order, same CC-MAP.md ranges) so tools/gen_vst.py can generate params.h + the skin for the VST port. Keep in sync by hand with host_shim.cpp and docs/CC-MAP.md. VST index order is fixed (projects store values by index): new keys only ever go at the end. slot/load/save/cc_ch are wrapper-only (acid_vst.cpp); mute is upstream sd88me's; hold/shift/velrand were added after the NGEN ACDGEN's Hold Prob, Shift and Random Vel.",
   "chain_params": [
     { "key": "a_generate", "name": "Generate", "access": "write" },
     { "key": "a_mutate",   "name": "Mutate",   "access": "write" },
@@ -41,6 +41,16 @@
 
     { "key": "slot",       "name": "Preset",     "min": 1,   "max": 32 },
     { "key": "load",       "name": "Load",       "access": "write" },
-    { "key": "save",       "name": "Save",       "access": "write" }
+    { "key": "save",       "name": "Save",       "access": "write" },
+
+    { "key": "mute",       "name": "Mute",       "options": ["OFF", "ON"] },
+    { "key": "cc_ch",      "name": "Control Ch", "options": ["OFF", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"] },
+
+    { "key": "a_hold",     "name": "Hold A",     "min": 0.0, "max": 1.0 },
+    { "key": "a_shift",    "name": "Shift A",    "min": -7,  "max": 7 },
+    { "key": "a_velrand",  "name": "Vel Rand A", "min": 0.0, "max": 1.0 },
+    { "key": "b_hold",     "name": "Hold B",     "min": 0.0, "max": 1.0 },
+    { "key": "b_shift",    "name": "Shift B",    "min": -7,  "max": 7 },
+    { "key": "b_velrand",  "name": "Vel Rand B", "min": 0.0, "max": 1.0 }
   ]
 }

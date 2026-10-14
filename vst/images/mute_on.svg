@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 150 52">
+  <defs>
+    <radialGradient id="g" cx="0.5" cy="0.45" r="0.75"><stop offset="0" stop-color="#ffd27a"/><stop offset="0.45" stop-color="#ff9a1f"/><stop offset="1" stop-color="#d9600a"/></radialGradient>
+  </defs>
+  <rect x="0" y="0" width="150" height="52" rx="9" fill="#ff8a1a" opacity="0.28"/>
+  <rect x="1" y="1" width="148" height="50" rx="7" fill="#ff8a1a" opacity="0.35"/>
+  <rect x="2" y="2" width="146" height="48" rx="6" fill="url(#g)" stroke="#7a3a06" stroke-width="2"/>
+  <rect x="8" y="5" width="134" height="15" rx="5" fill="#ffffff" opacity="0.35"/>
+  <text x="75" y="27" text-anchor="middle" dominant-baseline="central" font-family="'Univers 53 Extended', 'Titillium Web', sans-serif" font-weight="700" font-size="17" letter-spacing="1.4" fill="#2a1000">MUTE</text>
+</svg>

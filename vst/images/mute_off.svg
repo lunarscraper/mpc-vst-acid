@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 150 52">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5a3412"/><stop offset="1" stop-color="#3a2008"/></linearGradient>
+  </defs>
+  <rect x="2" y="2" width="146" height="48" rx="6" fill="url(#g)" stroke="#1a0e04" stroke-width="2"/>
+  <rect x="6" y="5" width="138" height="16" rx="4" fill="#ffffff" opacity="0.06"/>
+  <text x="75" y="27" text-anchor="middle" dominant-baseline="central" font-family="'Univers 53 Extended', 'Titillium Web', sans-serif" font-weight="700" font-size="17" letter-spacing="1.4" fill="#d8b48a" opacity="0.55">MUTE</text>
+</svg>

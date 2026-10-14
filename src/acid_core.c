@@ -50,6 +50,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <stdint.h>
 #include <stdio.h>
 #include "acid_core.h"
 
@@ -131,6 +133,10 @@ static const int AUTO_GEN_BAR_STEPS[6] = {16, 32, 64, 128, 256, 512};
  * safe to also carry the dump's note-on/off/CC65 stream. */
 #define DUMP_CHANNEL 15
 
+#define HOLD_MAX_TIE 3     /* a held note lasts up to 1 + 3 sixteenths */
+#define SHIFT_MAX    7     /* scale degrees */
+#define VELRAND_MAX  48    /* velocity steps at VEL RAND 100% */
+
 typedef struct {
     /* PRNG -- xorshift32. `rng` is the live, ever-advancing generator state
      * (mutate consumes from wherever it currently sits); `seed` is the last
@@ -156,6 +162,7 @@ typedef struct {
     int8_t x_walk[MAX_STEPS];                             /* secondary: density walk delta -1/0/+1 */
     float x_deg[MAX_STEPS], x_oct[MAX_STEPS], x_slide[MAX_STEPS];
     float d_mix[MAX_STEPS];                               /* primary/secondary pick (Algo) */
+    float d_hold[MAX_STEPS];                              /* HOLD: a note is held through the rests after it */
     int length;
     int position;
 
@@ -164,6 +171,17 @@ typedef struct {
     int octave_range;   /* 1..5 */
     float gate;         /* 0.05..1.0, fraction of a step */
     int algo;           /* 1..16 */
+    /* VST port -- after the NGEN ACDGEN's Hold Prob / Shift / Random Vel (own code, not a port):
+     *   hold     0..1  chance that a note is held on through the rests that follow it (up to
+     *                  HOLD_MAX_TIE steps, so up to a quarter note) instead of stopping after Gate;
+     *                  live, read per step from d_hold[] like the other knobs read their dice
+     *   shift    -7..7 diatonic transpose: moves every note by whole scale degrees, so the line
+     *                  stays in the scale (with Chromatic it is plain semitones)
+     *   velrand  0..1  random deviation of each note's velocity, up to +/-VELRAND_MAX at 1 */
+    float hold;
+    int shift;
+    float velrand;
+    int tie_left;       /* rest steps the current held note may still be tied through */
 
     /* Advanced page -- per-sequencer playback modifiers. Offset is read-side
      * only (rotates which stored step plays, never touches steps[]/degrees[]/
@@ -228,6 +246,9 @@ typedef struct {
      * TD-3-MO) instead of a MIDI synth. No Move equivalent. See
      * emit_step_for_seq()'s own comment for exactly what changes. */
     int cv_mode;
+    long song_step;        /* VST: absolute 16th index of the step about to fire (set before each 0xF9), -1 = count steps */
+    int mute;              /* VST: the host wrapper drops note-ons while set (sequence keeps running in time) */
+    uint32_t vel_rng;      /* VST: VEL RAND's own PRNG, so it never changes what Generate/Mutate/Jitter draw */
     int swing_pct;         /* 50-75, MPC-style 16th swing; 50 = straight.
                            * Whole percent, but the chain_param below is
                            * declared "float" (like Length A/B) so the knob
@@ -247,6 +268,7 @@ typedef struct {
     int running;
     int follow_transport;
     int clock_pulses;
+    int grid_driven;       /* 1 once the host sent a 0xF9 step boundary: 0xF8 then only keeps sync alive */
     double samples_per_step;
     double sample_accum;
     int pulse_sync_active;
@@ -411,6 +433,8 @@ static void regenerate_pattern(acid_seq_t *s, int scale_idx, uint32_t seed) {
         s->d_mix[i] = rng_next_f(&rng);
     }
     s->rng = rng;
+    uint32_t hr = (seed ? seed : 1) * 2654435761u ^ 0x5bd1e995u;   /* HOLD dice: own stream, see acid_seq_t */
+    for (int i = 0; i < MAX_STEPS; i++) s->d_hold[i] = rng_next_f(&hr);
     derive_pattern(s, scale_idx);
 }
 
@@ -426,6 +450,7 @@ static void mutate_pattern(acid_seq_t *s, int scale_idx) {
             s->d_slide[i] = rng_next_f(&rng);
             s->x_walk[i] = (int8_t)((int)(rng_next_f(&rng) * 3.0f) - 1);
             s->x_slide[i] = rng_next_f(&rng);
+            s->d_hold[i] = rng_next_f(&rng);
         } else {
             s->d_root[i] = 1.0f;   /* a mutated downbeat takes its new pitch, not the root again */
             s->d_deg[i] = rng_next_f(&rng);
@@ -444,15 +469,16 @@ static void mutate_pattern(acid_seq_t *s, int scale_idx) {
  * pattern. "D1" + rng + seed (8 hex each), then per step ten dice as 16-bit
  * hex and the walk delta as one digit. Hex only, so it can't collide with the
  * chunk's "key=value;" separators. */
-#define DICE_STR_LEN (2 + 16 + MAX_STEPS * 41)
+#define DICE_STR_LEN_D1 (2 + 16 + MAX_STEPS * 41)
+#define DICE_STR_LEN    (2 + 16 + MAX_STEPS * 45)   /* D2: an 11th die per step (HOLD) */
 static int dice_to_str(const acid_seq_t *s, char *buf, int buf_len) {
     if (buf_len < DICE_STR_LEN + 1) return -1;
     char *w = buf;
-    w += sprintf(w, "D1%08x%08x", (unsigned)s->rng, (unsigned)s->seed);
+    w += sprintf(w, "D2%08x%08x", (unsigned)s->rng, (unsigned)s->seed);
     for (int i = 0; i < MAX_STEPS; i++) {
-        const float d[10] = { s->d_gate[i], s->d_root[i], s->d_deg[i], s->d_oct[i], s->d_acc[i],
-                              s->d_slide[i], s->x_deg[i], s->x_oct[i], s->x_slide[i], s->d_mix[i] };
-        for (int k = 0; k < 10; k++) {
+        const float d[11] = { s->d_gate[i], s->d_root[i], s->d_deg[i], s->d_oct[i], s->d_acc[i],
+                              s->d_slide[i], s->x_deg[i], s->x_oct[i], s->x_slide[i], s->d_mix[i], s->d_hold[i] };
+        for (int k = 0; k < 11; k++) {
             float v = d[k] < 0.0f ? 0.0f : d[k] > 1.0f ? 1.0f : d[k];
             w += sprintf(w, "%04x", (unsigned)(v * 65535.0f + 0.5f));
         }
@@ -473,8 +499,11 @@ static int hex_n(const char *p, int n, unsigned *out) {
     *out = v;
     return 1;
 }
-static int dice_from_str(acid_seq_t *s, const char *str) {   /* all or nothing */
-    if (!str || strlen(str) != DICE_STR_LEN || str[0] != 'D' || str[1] != '1') return 0;
+static int dice_from_str(acid_seq_t *s, const char *str) {   /* all or nothing; D1 (before HOLD) or D2 */
+    if (!str || str[0] != 'D') return 0;
+    size_t len = strlen(str);
+    int nd = (str[1] == '2' && len == DICE_STR_LEN) ? 11 : (str[1] == '1' && len == DICE_STR_LEN_D1) ? 10 : 0;
+    if (!nd) return 0;
     acid_seq_t tmp = *s;
     unsigned v;
     const char *p = str + 2;
@@ -483,14 +512,18 @@ static int dice_from_str(acid_seq_t *s, const char *str) {   /* all or nothing *
     if (!hex_n(p, 8, &v)) return 0;
     tmp.seed = v; p += 8;
     for (int i = 0; i < MAX_STEPS; i++) {
-        float *d[10] = { &tmp.d_gate[i], &tmp.d_root[i], &tmp.d_deg[i], &tmp.d_oct[i], &tmp.d_acc[i],
-                         &tmp.d_slide[i], &tmp.x_deg[i], &tmp.x_oct[i], &tmp.x_slide[i], &tmp.d_mix[i] };
-        for (int k = 0; k < 10; k++) {
+        float *d[11] = { &tmp.d_gate[i], &tmp.d_root[i], &tmp.d_deg[i], &tmp.d_oct[i], &tmp.d_acc[i],
+                         &tmp.d_slide[i], &tmp.x_deg[i], &tmp.x_oct[i], &tmp.x_slide[i], &tmp.d_mix[i], &tmp.d_hold[i] };
+        for (int k = 0; k < nd; k++) {
             if (!hex_n(p, 4, &v)) return 0;
             *d[k] = (float)v / 65535.0f; p += 4;
         }
         if (*p < '0' || *p > '2') return 0;
         tmp.x_walk[i] = (int8_t)(*p++ - '1');
+    }
+    if (nd == 10) {   /* saved before HOLD existed: give it HOLD dice from the saved seed, as Generate would */
+        uint32_t hr = (tmp.seed ? tmp.seed : 1) * 2654435761u ^ 0x5bd1e995u;
+        for (int i = 0; i < MAX_STEPS; i++) tmp.d_hold[i] = rng_next_f(&hr);
     }
     *s = tmp;
     return 1;
@@ -514,7 +547,12 @@ static int note_for_step(const acid_seq_t *s, int scale_idx, int root, int trans
      * incoming notes (0 = play at the Root knob's key); `s->tune` is this
      * sequencer's own interval on top of that. */
     int base = 24 + root + transpose + s->tune;
-    int note = base + sc->degrees[s->degrees[step_idx]] + 12 * s->octaves[step_idx];
+    /* SHIFT: whole scale degrees, carrying into the octave (floor division, so -1 from degree 0 is the
+     * scale's top degree an octave down) */
+    int d = (int)s->degrees[step_idx] + s->shift, oct = s->octaves[step_idx];
+    while (d < 0) { d += sc->len; oct--; }
+    while (d >= sc->len) { d -= sc->len; oct++; }
+    int note = base + sc->degrees[d] + 12 * oct;
     if (note < 0) note = 0;
     if (note > 127) note = 127;
     return note;
@@ -713,12 +751,22 @@ static int kill_all_notes(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[],
  *     Mod Wheel is the CC a Force CV track's own CV-row assignment menu
  *     expects for a non-pitch/velocity/gate row (see docs/CC-MAP.md). The
  *     on/off semantics (127 on, 0 off) are otherwise unchanged. */
-static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int prev_pos, int vel_scale,
+static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int prev_pos, int vel_scale, int may_tie,
                               uint8_t out_msgs[][3], int out_lens[], int max_out) {
     acid_seq_t *s = &t->seq[seq_idx];
     int count = 0;
     int pidx = play_idx(s, s->position);
     uint8_t kind = s->steps[pidx];
+
+    /* HOLD: a rest after a held note keeps that note sounding (a tie), up to HOLD_MAX_TIE rests; the
+     * last tied step ends it after Gate like any other note. may_tie is 0 when another sequencer is
+     * the audible one on this step (Blend modes), so a mono line never gets two notes at once. */
+    if (kind == STEP_REST && may_tie && s->tie_left > 0 && s->last_note_on >= 0) {
+        s->tie_left--;
+        s->gate_samples_remaining = (long)(t->samples_per_step * (s->tie_left > 0 ? 2.0 : (double)s->gate));
+        return 0;
+    }
+    s->tie_left = 0;
 
     if (kind == STEP_REST || vel_scale <= 0) {
         if (count < max_out) count += kill_seq_note(t, seq_idx, &out_msgs[count], &out_lens[count], max_out - count);
@@ -737,6 +785,8 @@ static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int pre
     } else {
         int base_vel = is_accent ? 118 : 72;
         vel = (base_vel * vel_scale) / 127;
+        if (s->velrand > 0.0f)   /* VEL RAND: +/- up to VELRAND_MAX, on top of accent and Blend */
+            vel += (int)((rng_next_f(&t->vel_rng) * 2.0f - 1.0f) * s->velrand * (float)VELRAND_MAX);
         if (vel < 1) vel = 1;
         if (vel > 127) vel = 127;
     }
@@ -777,6 +827,12 @@ static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int pre
     }
     s->last_note_on = note;
     s->gate_samples_remaining = (long)(t->samples_per_step * s->gate);
+    if (kind != STEP_SLIDE && s->hold > 0.0f && s->d_hold[pidx] < s->hold) {
+        /* HOLD: tie through the rests that follow (counted in play order by emit, so DIR/Jitter/Offset
+         * are respected); held through to the next step boundary rather than cut after Gate */
+        s->tie_left = HOLD_MAX_TIE;
+        s->gate_samples_remaining = (long)(t->samples_per_step * 2.0);   /* > the longest swung gap (1.5 steps) */
+    }
     return count;
 }
 
@@ -942,11 +998,32 @@ static int chain_begin_tick(acid_inst_t *t) {
  * independent wrap is what makes differently-lengthed A/B patterns a real
  * polymeter when Reset Both is Off, rather than something that needs
  * explicit polymeter support. */
+/* Song-locked position: the step a sequencer plays at song 16th `n` (already folded by Reset All), as a
+ * pure function -- so a lost or doubled host step can never shift the pattern. Same orders as next_position(). */
+static int song_position(const acid_seq_t *s, long n) {
+    int L = s->length;
+    if (L <= 1) return 0;
+    switch (s->dir) {
+        case 1: return L - 1 - (int)(n % L);                       /* Rev */
+        case 2: { int p = (int)(n % (2 * L - 2)); return p < L ? p : 2 * L - 2 - p; }   /* Pendulum */
+        default: return (int)(n % L);                              /* Fwd */
+    }
+}
+
 static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], int max_out) {
     int count = 0;
 
+    long k = t->song_step;
+    t->song_step = -1;
+    int locked = k >= 0 && t->blend_mode != BM_CHAIN;   /* Chain takes turns between A and B: stays step-counted */
+    if (locked) t->swing_pulse_idx = k;                 /* Blend's per-step pattern follows the song too */
+    long n = k;
+    if (locked && t->reset_bars_idx != 4) n = k % BAR_STEPS[t->reset_bars_idx];
+
     int forced_reset = 0;
-    if (t->reset_bars_idx != 4) {
+    if (locked) {
+        t->bar_step_count = 0;
+    } else if (t->reset_bars_idx != 4) {
         t->bar_step_count++;
         if (t->bar_step_count >= BAR_STEPS[t->reset_bars_idx]) {
             t->bar_step_count = 0;
@@ -968,7 +1045,8 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
         acid_seq_t *s = &t->seq[i];
         if (s->auto_gen_idx != 0) {
             s->auto_gen_step_count++;
-            if (s->auto_gen_step_count >= AUTO_GEN_BAR_STEPS[s->auto_gen_idx - 1]) {
+            if (locked ? (k > 0 && k % AUTO_GEN_BAR_STEPS[s->auto_gen_idx - 1] == 0)
+                       : s->auto_gen_step_count >= AUTO_GEN_BAR_STEPS[s->auto_gen_idx - 1]) {
                 s->auto_gen_step_count = 0;
                 regenerate_pattern(s, t->scale, rng_next_u32(&s->rng));
                 if (s->position >= s->length) s->position = s->length - 1;
@@ -998,7 +1076,7 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
             s->position = 0;
             s->pendulum_fwd = 1;  /* Reset Both is authoritative -- pendulum resumes forward */
         } else {
-            int np = next_position(s);
+            int np = locked ? song_position(s, n) : next_position(s);
             /* Jitter (Advanced) -- perturb WHICH step plays, never WHEN, so it
              * stays independent of swing_gap_mult()/swing_delay_frac(). Rolls
              * off the same per-seq PRNG stream Mutate draws from, so it stays
@@ -1030,7 +1108,7 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
         for (int i = 0; i < NUM_SEQS; i++) {
             int vel_scale = (i == SEQ_A) ? vel_a : vel_b;
             if (count < max_out) {
-                count += emit_step_for_seq(t, i, i, prev[i], vel_scale, &out_msgs[count], &out_lens[count], max_out - count);
+                count += emit_step_for_seq(t, i, i, prev[i], vel_scale, 1, &out_msgs[count], &out_lens[count], max_out - count);
             }
         }
         return count;
@@ -1051,7 +1129,7 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
             if ((pass == 0) == audible) continue;
             int pitch_seq = (i == SEQ_A && pitch_from_b) ? SEQ_B : i;
             if (count < max_out) {
-                count += emit_step_for_seq(t, i, pitch_seq, prev[i], audible ? 127 : 0,
+                count += emit_step_for_seq(t, i, pitch_seq, prev[i], audible ? 127 : 0, audible || pick < 0,
                                            &out_msgs[count], &out_lens[count], max_out - count);
             }
         }
@@ -1070,7 +1148,12 @@ static void *acid_create_instance(const char *module_dir, const char *config_jso
 
     for (int i = 0; i < NUM_SEQS; i++) {
         acid_seq_t *s = &t->seq[i];
-        s->rng = 0xBEEFu + (uint32_t)i;
+        /* a new instance starts from a fresh random pattern; a saved project restores its own via the chunk's seed */
+        {
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+            uint32_t r = (uint32_t)ts.tv_nsec * 2654435761u ^ (uint32_t)ts.tv_sec ^ (uint32_t)(uintptr_t)t ^ (0x9E3779B9u * (uint32_t)(i + 1));
+            s->rng = r ? r : 0xBEEFu + (uint32_t)i;
+        }
         s->seed = s->rng;
         s->length = 16;
         s->density = 0.7f;
@@ -1094,6 +1177,9 @@ static void *acid_create_instance(const char *module_dir, const char *config_jso
     t->bpm = 120.0f;
     t->running = 0;
     t->follow_transport = 1;
+    t->song_step = -1;
+    t->vel_rng = t->seq[SEQ_A].rng ^ 0xA5A5A5A5u;
+    if (!t->vel_rng) t->vel_rng = 1;
 
     if (g_host && g_host->get_clock_status) {
         if (g_host->get_clock_status() == MOVE_CLOCK_STATUS_RUNNING) t->running = 1;
@@ -1129,7 +1215,7 @@ static int acid_process_midi(void *instance, const uint8_t *in_msg, int in_len,
     if (status == 0xF8) { /* MIDI clock tick, 24 PPQN */
         t->pulse_sync_active = 1;
         t->blocks_since_last_pulse = 0;
-        if (t->running) {
+        if (t->running && !t->grid_driven) {
             t->clock_pulses++;
             if (t->clock_pulses >= swing_pulse_target(t)) {
                 t->clock_pulses = 0;
@@ -1139,6 +1225,16 @@ static int acid_process_midi(void *instance, const uint8_t *in_msg, int in_len,
             }
         }
         return 0;
+    }
+    if (status == 0xF9) { /* step boundary: the host places each 16th on the song-position grid itself
+                           * (no pulse counting, so a lost pulse or a mid-song start can't shift the phase) */
+        t->grid_driven = 1;
+        t->pulse_sync_active = 1;
+        t->blocks_since_last_pulse = 0;
+        if (!t->running || (in_len >= 2 && in_msg[1] == 1)) return 0;   /* [0xF9, 1] = arm only, no step */
+        int fired = advance_all(t, out_msgs, out_lens, max_out);
+        t->swing_pulse_idx++;
+        return fired;
     }
     if (status == 0xFA) { /* Start */
         if (t->follow_transport) {
@@ -1314,6 +1410,9 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
             uint32_t seed = rng_next_u32(&s->rng);
             regenerate_pattern(s, t->scale, seed);
             if (s->position >= s->length) s->position = s->length - 1;
+        } else if (strcmp(k, "seed") == 0) {   /* project reload: rebuild the pattern a saved Generate made */
+            uint32_t seed = (uint32_t)strtoul(val, NULL, 10);
+            if (seed) { regenerate_pattern(s, t->scale, seed); if (s->position >= s->length) s->position = s->length - 1; }
         } else if (strcmp(k, "mutate") == 0) {
             mutate_pattern(s, t->scale);
         } else if (strcmp(k, "dice") == 0) {
@@ -1372,6 +1471,18 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
             if (v < 0.05f) v = 0.05f;
             if (v > 1.0f) v = 1.0f;
             s->gate = v;
+        } else if (strcmp(k, "hold") == 0) {
+            float v = parse_float(val, 0.0f);
+            s->hold = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        } else if (strcmp(k, "shift") == 0) {
+            float f = parse_float(val, 0.0f);
+            int v = (int)(f < 0.0f ? f - 0.5f : f + 0.5f);   /* the wrapper sends "-2.43": round, both signs */
+            if (v < -SHIFT_MAX) v = -SHIFT_MAX;
+            if (v >  SHIFT_MAX) v =  SHIFT_MAX;
+            s->shift = v;
+        } else if (strcmp(k, "velrand") == 0) {
+            float v = parse_float(val, 0.0f);
+            s->velrand = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
         } else if (strcmp(k, "algo") == 0) {
             int v = parse_int(val, 1);
             if (v < 1) v = 1;
@@ -1454,6 +1565,10 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
          * changes (accent-via-velocity swing, slide CC target). */
         int v = parse_int(val, 0);
         t->cv_mode = v ? 1 : 0;
+    } else if (strcmp(key, "song_step") == 0) {
+        t->song_step = strtol(val, NULL, 10);
+    } else if (strcmp(key, "mute") == 0) {
+        t->mute = parse_int(val, 0) ? 1 : 0;
     }
 }
 
@@ -1478,9 +1593,14 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
         else if (strcmp(k, "length") == 0) n = snprintf(buf, buf_len, "%d", s->length);
         else if (strcmp(k, "gate") == 0) n = snprintf(buf, buf_len, "%.3f", s->gate);
         else if (strcmp(k, "algo") == 0) n = snprintf(buf, buf_len, "%d", s->algo);
+        else if (strcmp(k, "hold") == 0) n = snprintf(buf, buf_len, "%.3f", s->hold);
+        else if (strcmp(k, "shift") == 0) n = snprintf(buf, buf_len, "%d", s->shift);
+        else if (strcmp(k, "velrand") == 0) n = snprintf(buf, buf_len, "%.3f", s->velrand);
         else if (strcmp(k, "tune") == 0) n = snprintf(buf, buf_len, "%d", s->tune);
         else if (strcmp(k, "offset") == 0) n = snprintf(buf, buf_len, "%d", s->offset);
         else if (strcmp(k, "dir") == 0) n = snprintf(buf, buf_len, "%d", s->dir);
+        else if (strcmp(k, "pos") == 0) n = snprintf(buf, buf_len, "%d", s->position);   /* test hook */
+        else if (strcmp(k, "seed") == 0) n = snprintf(buf, buf_len, "%u", (unsigned)s->seed);
         else if (strcmp(k, "channel") == 0) n = snprintf(buf, buf_len, "%d", s->out_ch + 1);  /* FORCE-ONLY */
         else if (strcmp(k, "auto_gen") == 0) n = snprintf(buf, buf_len, "%d", s->auto_gen_idx);  /* FORCE-ONLY */
         else if (strcmp(k, "generate") == 0 || strcmp(k, "mutate") == 0 || strcmp(k, "dump") == 0) n = snprintf(buf, buf_len, "off");
@@ -1498,6 +1618,7 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
     else if (strcmp(key, "swing") == 0) n = snprintf(buf, buf_len, "%d", t->swing_pct);
     else if (strcmp(key, "jitter") == 0) n = snprintf(buf, buf_len, "%.3f", t->jitter);
     else if (strcmp(key, "cv_mode") == 0) n = snprintf(buf, buf_len, "%d", t->cv_mode);  /* FORCE-ONLY */
+    else if (strcmp(key, "mute") == 0) n = snprintf(buf, buf_len, "%d", t->mute);
     else if (strcmp(key, "chain_params") == 0) {
         /* Not actually consulted for midi_fx loading -- chain_midi.c reads
          * chain_params straight out of module.json on disk (parse_chain_params),

@@ -1,0 +1,12 @@
+{
+  "name": "Acid FX",
+  "vendor": "sd88me",
+  "uid": "AcFx",
+  "version": 1100,
+  "so": "acid_fx.so",
+  "effect": true,
+  "module": "../vst/module.json",
+  "layout": "../vst/layout.conf",
+  "art": "html",
+  "_comment": "Insert-effect variant of ../vst (same acid_vst.cpp, same parameters and skin): 'effect' makes gen_vst.py emit PLUG_EFFECT in params.h and a category=Effect plugin-list entry, so Acid loads as an insert and takes none of the 8 plugin instrument slots. Audio passes through untouched; notes go out through the plugin's own ALSA port 'Acid FX'. Own uid/so/name, so it installs next to the instrument variant."
+}
