@@ -1,0 +1,33 @@
+# Build Acid FX (the insert-effect variant, vst-fx/) into a DRAFT release (acid-fx-vst-v<version>):
+# Actions -> "VST release FX (draft)" -> Run workflow. dry_run builds the zip and skin previews as run
+# artifacts only. Same pinned mpc-vst-plugins commit and MPC OS 2.x skin shape as vst-release.yml.
+name: VST release FX (draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, e.g. 1.1.0
+        required: true
+        default: 1.1.0
+      dry_run:
+        description: Build only (zip + skin previews as run artifacts), no draft release
+        type: boolean
+        default: false
+
+jobs:
+  acid-fx:
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@7ee6aba241f61061dbc9e3264500f7dc0d56fd13
+    permissions:
+      contents: write
+    with:
+      tag: acid-fx-vst-v${{ inputs.version }}
+      version: ${{ inputs.version }}
+      tools_ref: 7ee6aba241f61061dbc9e3264500f7dc0d56fd13
+      vst_dir: vst-fx
+      build: SHADOW_SKIN_MPC_OS=2 bash vst-fx/build.sh
+      host_test: bash vst-fx/test.sh
+      plugin_id: acid-fx
+      license: GPL-3.0-only
+      about: Acid as an insert effect - the TB-303-style two-line bassline sequencer drives a synth track over MIDI without using a plugin instrument slot.
+      dry_run: ${{ inputs.dry_run }}
