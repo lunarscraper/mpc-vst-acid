@@ -13,7 +13,7 @@ no sound itself. It is a native VST2 plugin with a touchscreen skin and Q-Link c
 
 <img width="640" height="400" alt="2026-09-29T124456312Z" src="https://github.com/user-attachments/assets/a9bac6d3-8b13-4715-95be-18ebab731cce" />
 
-**Version 1.1.0** · GPL-3.0-only · by sd88me (fork with presets, live knobs, HOLD/SHIFT/VEL RAND and the Acid FX insert variant)
+**Version 1.2.0** · GPL-3.0-only · by sd88me (fork with presets, live knobs, HOLD/SHIFT/VEL RAND, the Acid FX insert variant and the EDIT and MOD pages from upstream 2.0)
 
 ## Use it
 1. Add **Acid** to an instrument track from the plugin browser.
@@ -21,7 +21,7 @@ no sound itself. It is a native VST2 plugin with a touchscreen skin and Q-Link c
    to hear it, set the MIDI input to that port and set **MIDI CH** to the channel that track listens on.
 3. Press **GENERATE** on SEQ A, and on SEQ B if you want a second line, then start the transport.
 
-The screen has three pages, and the Q-Links follow the page you are on.
+The screen has six pages (SEQ A, EDIT A, SEQ B, EDIT B, MOD, GLOBAL), and the Q-Links follow the page you are on.
 
 ### SEQ A and SEQ B
 Each line is an independent sequencer of 2 to 32 steps. Both follow the MPC transport through the fork's clock fix: every 24-PPQN pulse is taken from the host's song position by its absolute index and fed exactly once, so tempo changes, uneven audio blocks and loop wraps neither double nor lose a step. The controls are the same
@@ -55,6 +55,43 @@ ACDGEN generator. They are written from scratch from the NGEN manual's descripti
 
 The Q-Links carry knobs and selectors only. GENERATE, MUTATE, LOAD, SAVE, MUTE and CV MODE are touchscreen-only (or
 MIDI CC), so turning a Q-Link never fires a trigger by accident.
+
+### EDIT A and EDIT B
+Each line has an edit page next to its SEQ page (taken over from upstream sd88me/mpc-vst-acid 2.0), showing 16 steps
+at a time. A yellow marker above the step numbers follows the playing step while the transport runs (on the bar you
+are viewing). The STEPS 1-16 / STEPS 17-32 switch picks which bar of a longer pattern you see; GENERATE and MUTATE
+are there too. The 16 Q-Links turn the 16 NOTE sliders. Per step:
+
+- **ON** switches the step between a note and a rest. A rest keeps its note, so switching it on brings the note back.
+- **NOTE** is a vertical slider in scale steps from the root (the white line): one scale octave below it, up to five
+  above, so it covers OCTAVES 1–5. The number under the slider is the value (0 = root, 7 = an octave up in a
+  seven-note scale). SHIFT and TUNE still move the whole line on top of it.
+- **ACC** and **SLIDE**: on the edit page a step can be both, as on a 303 (an accented note that slides into the
+  next). GENERATE still rolls them as before, so existing patterns sound the same.
+- **LOCK** marks a step as hand-edited. Editing a step locks it. A locked step keeps its note, accent and slide when
+  DENSITY, ACCENT, SLIDE, OCTAVES, ALGO, LENGTH, SCALE, MUTATE or an LFO reshape the pattern. Tap LOCK to hand the
+  step back to the knobs; it takes the knobs' value again at once.
+
+Locks are saved with the project and in the preset slots, and cleared by GENERATE and REGEN.
+
+### MOD
+Two LFOs, each with two modulation slots (taken over from upstream sd88me/mpc-vst-acid 2.0, adapted to this fork's
+live knobs and OCTAVES 1–5). Per LFO:
+
+| Control | What it does |
+|---|---|
+| SHAPE | Sine, triangle, saw, square or sample & hold |
+| RATE | Free-running speed, 0.05 to 20 Hz (shown while SYNC is off) |
+| SYNC / DIV | With SYNC on, one LFO cycle lasts 1/4 note up to 16 bars and is locked to the song position, so it starts at the same point every time the song plays from there |
+| MOD 1 DEST / MOD 2 DEST | What the slot moves: DENSITY, ACCENT, SLIDE, OCTAVES, LENGTH, GATE or OFFSET on either line, or BLEND |
+| AMOUNT | -100 to +100 per slot. +100 sweeps the whole range of the destination |
+
+Your knob values are never changed: the LFOs are added on top while the sequence plays, so the knobs, the presets
+and the saved project keep your own settings. Turning the AMOUNT back to 0 gives back exactly the pattern you had.
+LFO settings are saved with the project and in the preset slots; a slot saved before 1.2.0 loads with both LFOs off.
+
+The Q-Links on MOD carry SHAPE, RATE, DIV, both destinations and both amounts of each LFO; SYNC stays on the
+touchscreen (or MIDI CC), like the other switches.
 
 ### GLOBAL
 | Control | What it does |
@@ -160,6 +197,19 @@ Sequencer-Plugins vom selben Controller steuern, jedes auf seinem eigenen Kanal.
 | 76 | Blend A>B | | |
 | 77 | CV Mode | | |
 | 78 | Mute | | |
+
+| CC | MOD LFO 1 | CC | MOD LFO 2 |
+|---|---|---|---|
+| 80 | Shape | 88 | Shape |
+| 81 | Rate | 89 | Rate |
+| 82 | Sync | 90 | Sync |
+| 83 | Div | 91 | Div |
+| 84 | Mod 1 Dest | 92 | Mod 1 Dest |
+| 85 | Mod 1 Amount | 93 | Mod 1 Amount |
+| 86 | Mod 2 Dest | 94 | Mod 2 Dest |
+| 87 | Mod 2 Amount | 95 | Mod 2 Amount |
+
+Bei den Amount-CCs ist 64 ≈ 0 (keine Modulation), 0 = −100, 127 = +100.
 
 Im Log (`/tmp/acid_vst.log` bzw. `/tmp/acid_fx_vst.log`) steht alle 5 s `control ch N: X cc seen, Y used`.
 „seen" sind alle CCs, die ankommen, „used" die auf dem eingestellten Kanal mit gültiger Nummer. Damit lässt sich

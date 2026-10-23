@@ -312,6 +312,126 @@ int main(void) {
         if (!plain0 || distinct < 6) { printf("FAIL vel rand\n"); fails++; }
     }
 
+    /* MOD page (engine level): LFO 1 as a synced square over 4 steps on A DENSITY at +100 -> density 1 on the
+     * first two steps of each cycle, 0 on the other two; amount 0 leaves the pattern untouched; the knob keeps
+     * the user's value */
+    {
+        midi_fx_api_v1_t *api = move_midi_fx_init(&T_HOST);
+        static ev_t m0[4000], m1[4000];
+        #define MBASE "a_seed", "777", "a_density", "0.5", "a_slide", "0", "blend", "-63", "b_density", "0", \
+                      "lfo1_shape", "3", "lfo1_sync", "1", "lfo1_div", "0", "lfo1_d1", "1"
+        const char *const k0[] = { "a_seed", "777", "a_density", "0.5", "a_slide", "0", "blend", "-63", "b_density", "0", NULL };
+        const char *const kz[] = { MBASE, "lfo1_a1", "0", NULL };
+        const char *const km[] = { MBASE, "lfo1_a1", "100", NULL };
+        int n0 = run_core(api, k0, 64, m0, 4000), nz = run_core(api, kz, 64, m1, 4000);
+        int same = n0 == nz && !memcmp(m0, m1, sizeof(ev_t) * (size_t)n0);
+        int nm = run_core(api, km, 64, m1, 4000), on_hi = 0, on_lo = 0, steps_hi[64] = {0};
+        for (int i = 0; i < nm; i++) if ((m1[i].m[0] & 0xF0) == 0x90 && m1[i].m[2]) {
+            if (m1[i].step % 4 < 2) { on_hi++; steps_hi[m1[i].step] = 1; } else on_lo++;
+        }
+        int full = 1;
+        for (int k = 0; k < 64; k++) if (k % 4 < 2 && !steps_hi[k]) full = 0;
+        void *inst = api->create_instance(".", NULL);
+        for (int i = 0; km[i]; i += 2) api->set_param(inst, km[i], km[i + 1]);
+        char buf[32] = {0};
+        api->get_param(inst, "a_density", buf, sizeof buf);
+        int knob = !strcmp(buf, "0.500");
+        api->get_param(inst, "lfo1_a1", buf, sizeof buf);
+        int amt = !strcmp(buf, "100");
+        api->destroy_instance(inst);
+        printf("mod: amount 0 = unmodulated %d, square on density: notes high %d (every step %d) / low %d, knob kept %d, amt %d\n",
+               same, on_hi, full, on_lo, knob, amt);
+        if (!same || !full || on_lo || !knob || !amt) { printf("FAIL mod\n"); fails++; }
+    }
+
+    /* MOD over MIDI CC: CC 84 = LFO 1 Dest 1, CC 95 = LFO 2 Amount 2; both end up in the chunk */
+    {
+        acid_dbg_control(a, 0xBF, 84, 127);                    /* last option: BLEND */
+        acid_dbg_control(a, 0xBF, 95, 0);                      /* -100 */
+        void *ck = 0;
+        a->d(a, 23, 0, 0, &ck, 0);
+        int d1 = strstr((char *)ck, "lfo1_d1=15;") != NULL, a2 = strstr((char *)ck, "lfo2_a2=-100;") != NULL;
+        printf("mod cc: lfo1_d1 -> BLEND %d, lfo2_a2 -> -100 %d\n", d1, a2);
+        if (!d1 || !a2) { printf("FAIL mod cc\n"); fails++; }
+        acid_dbg_control(a, 0xBF, 84, 0);
+        acid_dbg_control(a, 0xBF, 95, 64);
+    }
+
+    /* EDIT pages (engine level): a hand-edited step is locked and survives knob moves; LOCK off hands it back;
+     * the locks round-trip as text; GENERATE clears them; the bar switch shows steps 17-32 */
+    {
+        midi_fx_api_v1_t *api = move_midi_fx_init(&T_HOST);
+        void *x = api->create_instance(".", NULL);
+        char v[640], g[32];
+        #define GP(k) (api->get_param(x, k, g, sizeof g) > 0 ? atoi(g) : -99)
+        api->set_param(x, "a_seed", "999");
+        api->set_param(x, "a_e2_note", "10");
+        api->set_param(x, "a_e2_acc", "1");
+        api->set_param(x, "a_e2_sld", "1");
+        api->set_param(x, "a_e3_note", "-5.00002");                   /* host float text rounds, below the root */
+        int ok1 = GP("a_e2_note") == 10 && GP("a_e2_acc") == 1 && GP("a_e2_sld") == 1 && GP("a_e2_lock") == 1 &&
+                  GP("a_e2_gate") == 1 && GP("a_e3_note") == -5;
+        api->set_param(x, "a_density", "0");                            /* every unlocked step a rest */
+        api->set_param(x, "a_octaves", "5");
+        int ok2 = GP("a_e2_note") == 10 && GP("a_e2_gate") == 1 && GP("a_e2_acc") == 1 && GP("a_e3_note") == -5 && GP("a_e5_gate") == 0;
+        api->get_param(x, "a_locks", v, sizeof v);
+        void *y = api->create_instance(".", NULL);
+        char dice[2048];
+        api->get_param(x, "a_dice", dice, sizeof dice);
+        api->set_param(y, "a_density", "0"); api->set_param(y, "a_octaves", "5");
+        api->set_param(y, "a_dice", dice);
+        api->set_param(y, "a_locks", v);
+        char g2[32]; int y2 = api->get_param(y, "a_e2_note", g2, sizeof g2) > 0 ? atoi(g2) : -99;
+        int ok3 = y2 == 10 && strlen(v) > 4;
+        api->set_param(x, "a_e2_lock", "0");                            /* back to the knobs: density 0 -> rest */
+        int ok4 = GP("a_e2_gate") == 0 && GP("a_e2_lock") == 0;
+        api->set_param(x, "a_generate", "go");
+        int ok5 = GP("a_e3_lock") == 0;
+        api->set_param(x, "a_length", "32");
+        api->set_param(x, "a_edit_bar", "1");
+        api->set_param(x, "a_e0_note", "7");
+        api->set_param(x, "a_edit_bar", "0");
+        api->get_param(x, "a_locks", v, sizeof v);
+        int ok6 = strncmp(v, "16.", 3) == 0 && GP("a_e0_lock") == 0;
+        api->destroy_instance(x); api->destroy_instance(y);
+        printf("edit: set+lock %d, survives knobs %d, locks round-trip %d, unlock follows knobs %d, generate clears %d, bar 2 %d\n",
+               ok1, ok2, ok3, ok4, ok5, ok6);
+        if (!(ok1 && ok2 && ok3 && ok4 && ok5 && ok6)) { printf("FAIL edit\n"); fails++; }
+        /* accent + slide on one step: an accented note (velocity 118) that slides into the next */
+        static ev_t ev[4000];
+        const char *const ke[] = { "a_seed", "4242", "a_density", "1", "a_accent", "0", "a_slide", "0", "blend", "-63",
+                                   "b_density", "0", "a_e4_acc", "1", "a_e4_sld", "1", NULL };
+        int ne = run_core(api, ke, 16, ev, 4000), acc4 = 0, porta5 = 0;
+        for (int i = 0; i < ne; i++) {
+            if (ev[i].step == 4 && (ev[i].m[0] & 0xF0) == 0x90 && ev[i].m[2] == 118) acc4 = 1;
+            if (ev[i].step == 5 && (ev[i].m[0] & 0xF0) == 0xB0 && ev[i].m[1] == 65 && ev[i].m[2] == 127) porta5 = 1;
+        }
+        printf("edit: accent+slide step -> accent %d, slides into the next %d\n", acc4, porta5);
+        if (!acc4 || !porta5) { printf("FAIL acc+slide\n"); fails++; }
+        #undef GP
+    }
+
+    /* EDIT pages (wrapper): a tap locks the step, a write of the same value doesn't, the cells stay out of the
+     * chunk but the locks are in it, and the running light is pushed while playing */
+    {
+        int ig = pidx("a_e6_gate"), il = pidx("a_e6_lock"), in = pidx("a_e7_note"), il7 = pidx("a_e7_lock"), ir = pidx("a_run");
+        float cur = a->getP(a, in);
+        a->setP(a, in, cur);                                   /* same value: no lock */
+        int nolock = a->getP(a, il7) < 0.5f;
+        float gv = a->getP(a, ig);
+        a->setP(a, ig, gv > 0.5f ? 0.0f : 1.0f);               /* tap */
+        int locked = a->getP(a, il) > 0.5f;
+        void *ck = 0;
+        a->d(a, 23, 0, 0, &ck, 0);
+        int nocells = !strstr((char *)ck, "a_e6_") && !strstr((char *)ck, "a_run=") && !strstr((char *)ck, "edit_bar");
+        int haslock = strstr((char *)ck, "a_locks=6.") != NULL || strstr((char *)ck, ",6.") != NULL;
+        automated[ir] = 0;
+        for (int k = 0; k < 200; k++) { a->pr(a, 0, out, 128); g_ti.ppqPos += ppq_per_block; }
+        printf("edit vst: same value no lock %d, tap locks %d, cells not saved %d, locks saved %d, running light pushes %d\n",
+               nolock, locked, nocells, haslock, automated[ir]);
+        if (!nolock || !locked || !nocells || !haslock || automated[ir] < 3) { printf("FAIL edit vst\n"); fails++; }
+    }
+
     /* chunk round-trip */
     void *chunk = 0;
     intptr_t n = a->d(a, 23, 0, 0, &chunk, 0);

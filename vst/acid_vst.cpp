@@ -38,6 +38,8 @@
  *                      7 length, 8 gate, 9 offset, 10 dir, 11 regen, 12 midi ch, 13 hold,
  *                      14 shift, 15 vel rand;  CC 56 = B tune offset
  *   CC 70..78          scale, root, swing, jitter, reset all, blend mode, blend a>b, cv mode, mute
+ *   CC 80..87          LFO 1: shape, rate, sync, div, dest 1, amount 1, dest 2, amount 2 (MOD page)
+ *   CC 88..95          LFO 2: the same
  *   CC 100..102        preset slot, load, save
  * Triggers (generate, mutate, load, save) fire when the value rises past 64. 0..127 is spread over
  * the parameter's range; selectors pick their option directly.
@@ -194,7 +196,7 @@ static inline bool ppq_clock_block(PpqClock *c, double ppq, double tempo, double
     return true;
 }
 
-#define BUILD_ID "fx-ccin-hold-2026-10-11"
+#define BUILD_ID "edit-mod-2026-10-22"
 
 /* ---------------------------------------------------------------------------
  * Preset bank: NSLOTS slots shared by every Acid instance and every project,
@@ -299,6 +301,8 @@ struct Plugin {
     volatile int release[NPARAMS] = {0};
     bool held[NPARAMS] = {false};  /* momentary params: host currently reports them pressed */
     float open[NPARAMS] = {0};     /* popup "open" flags (popup.h): wrapper-only, not saved */
+    float told[NPARAMS];           /* EDIT-page cells: the value the host was last told (-1: nothing yet) */
+    int edit_scan = 0;
     double last_ppq = 0.0;
     bool was_playing = false;
     PpqClock clk;                  /* lunarscraper clock fix: pulses by absolute ppq index (see PpqClock) */
@@ -315,7 +319,7 @@ struct Plugin {
     long dbg_sent = 0, dbg_noteons = 0; int dbg_vel_min = 127, dbg_vel_max = 0;   /* NO_ALSA test build only */
     int cur = 0;                   /* selected preset slot, 0-based */
     int slot = -1;                 /* ALSA port name slot: 0 = "Acid", 1 = "Acid 2", ... */
-    char chunk[8192] = {0};        /* params + both sequences (a_dice/b_dice, ~1.3 kB each) */
+    char chunk[8192] = {0};        /* params + both sequences (a_dice/b_dice, ~1.5 kB each) + locks */
     /* diagnostics: per-callback timing, logged periodically and on slow callbacks */
     double t_max = 0, t_sum = 0, t_last_log = 0;
     long blocks = 0, slow = 0;
@@ -377,8 +381,18 @@ static float str_to_norm(const param_t *p, const char *s) {
 }
 static int g_i_slot = -1, g_i_load = -1, g_i_save = -1;   /* wrapper-only params (module.json: slot/load/save) */
 static int g_i_cc = -1, g_i_mute = -1;                     /* wrapper-only cc_ch; mute (not saved in slots) */
+/* EDIT-page params ("a_e3_note", "b_edit_bar", "a_run" ...) mirror the pattern, which the engine changes behind
+ * the host's back (Generate, Mutate, knobs, LFOs, the bar switch). They are derived state: pushed to the host from
+ * processReplacing and left out of the project chunk and the preset slots (the locks are saved as "a_locks"). */
+static bool g_edit[NPARAMS], g_run[NPARAMS];
+static bool is_edit_param(int i) { return g_edit[i]; }
+static bool is_run_param(int i) { return g_run[i]; }
 static void find_preset_params() {
     for (int i = 0; i < NPARAMS; i++) {
+        const char *k = PARAMS[i].key;
+        bool seq = (k[0] == 'a' || k[0] == 'b') && k[1] == '_';
+        g_run[i] = seq && !std::strcmp(k + 2, "run");
+        g_edit[i] = seq && ((k[2] == 'e' && k[3] >= '0' && k[3] <= '9') || !std::strcmp(k + 2, "edit_bar") || g_run[i]);
         if (!std::strcmp(PARAMS[i].key, "slot")) g_i_slot = i;
         else if (!std::strcmp(PARAMS[i].key, "load")) g_i_load = i;
         else if (!std::strcmp(PARAMS[i].key, "save")) g_i_save = i;
@@ -395,6 +409,19 @@ static float get_norm(Plugin *w, int i) {
     int n;
     if (i == g_i_slot) return (float)w->cur / (NSLOTS - 1);
     if (i == g_i_cc) return PARAMS[i].nopts > 1 ? (float)w->cc_ch / (PARAMS[i].nopts - 1) : 0.0f;
+    if (is_run_param(i)) {   /* running light: 1..16 = the playing step's column in the bar shown, 0 = none */
+        int run = 0, bar = 0;
+        char key[16], b2[16];
+        if (w->was_playing) {
+            std::lock_guard<std::mutex> lk(w->lock);
+            std::snprintf(key, sizeof key, "%c_run", PARAMS[i].key[0]);
+            if (g_api->get_param(w->inst, key, b2, sizeof b2) > 0) run = std::atoi(b2);
+            std::snprintf(key, sizeof key, "%c_edit_bar", PARAMS[i].key[0]);
+            if (g_api->get_param(w->inst, key, b2, sizeof b2) > 0) bar = std::atoi(b2);
+        }
+        int col = run > 0 && (run - 1) / 16 == bar ? (run - 1) % 16 + 1 : 0;
+        return str_to_norm(&PARAMS[i], std::to_string(col).c_str());
+    }
     if (popup_is(i)) return w->open[i];
     if (PARAMS[i].momentary) return 0.0f;   /* triggers always read released, or the host echoes the press back */
     { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, PARAMS[i].key, buf, sizeof buf); }
@@ -662,7 +689,7 @@ extern "C" int acid_dbg_pos(AEffect *e) {
 static std::string build_state(Plugin *w, bool for_slot) {
     std::string s;
     for (int i = 0; i < NPARAMS; i++) {
-        if (PARAMS[i].momentary || popup_is(i) || i == g_i_slot) continue;
+        if (PARAMS[i].momentary || popup_is(i) || i == g_i_slot || is_edit_param(i)) continue;
         if (i == g_i_cc) {
             if (!for_slot) { s += "cc_ch="; s += std::to_string(w->cc_ch); s += ';'; }
             continue;
@@ -678,6 +705,12 @@ static std::string build_state(Plugin *w, bool for_slot) {
     /* the sequences themselves, after the knobs so they are restored last */
     for (const char *key : {"a_dice", "b_dice"}) {
         char big[2048];
+        int n;
+        { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, key, big, sizeof big); }
+        if (n > 0) { s += key; s += '='; s += big; s += ';'; }
+    }
+    for (const char *key : {"a_locks", "b_locks"}) {   /* hand-edited steps, after the dice (which clear them) */
+        char big[640];
         int n;
         { std::lock_guard<std::mutex> lk(w->lock); n = g_api->get_param(w->inst, key, big, sizeof big); }
         if (n > 0) { s += key; s += '='; s += big; s += ';'; }
@@ -706,7 +739,9 @@ static void apply_state(Plugin *w, std::string s, bool with_slot) {   /* by valu
 }
 /* Knobs added after the first presets/projects were saved: a state without them gets their defaults
  * (put first, so a state that has them overrides), not whatever the last sound had. */
-static const char *const NEW_KNOB_DEFAULTS = "a_hold=0;a_shift=0;a_velrand=0;b_hold=0;b_shift=0;b_velrand=0;";
+static const char *const NEW_KNOB_DEFAULTS = "a_hold=0;a_shift=0;a_velrand=0;b_hold=0;b_shift=0;b_velrand=0;"
+    "lfo1_shape=0;lfo1_rate=40;lfo1_sync=0;lfo1_div=2;lfo1_d1=0;lfo1_a1=0;lfo1_d2=0;lfo1_a2=0;"   /* MOD (1.2.0): a */
+    "lfo2_shape=0;lfo2_rate=40;lfo2_sync=0;lfo2_div=2;lfo2_d1=0;lfo2_a1=0;lfo2_d2=0;lfo2_a2=0;";  /* slot from before is unmodulated */
 static void slot_load(Plugin *w) {
     std::string c;
     { std::lock_guard<std::mutex> lk(g_bank_lock); bank_reload_locked(); c = g_slot_chunk[w->cur]; }
@@ -729,10 +764,12 @@ static const char *cc_key(int cc, char *buf, size_t max) {
                                         "length", "gate", "offset", "dir", "auto_gen", "channel", "hold", "shift", "velrand"};
     static const char *const GLOB[9] = {"scale", "root", "swing", "jitter", "reset_bars", "blend_mode", "blend", "cv_mode", "mute"};
     static const char *const PRE[3] = {"slot", "load", "save"};
+    static const char *const LFO[8] = {"shape", "rate", "sync", "div", "d1", "a1", "d2", "a2"};
     if (cc >= 20 && cc <= 35) { std::snprintf(buf, max, "a_%s", SEQ[cc - 20]); return buf; }
     if (cc >= 40 && cc <= 55) { std::snprintf(buf, max, "b_%s", SEQ[cc - 40]); return buf; }
     if (cc == 56) return "b_tune";
     if (cc >= 70 && cc <= 78) return GLOB[cc - 70];
+    if (cc >= 80 && cc <= 95) { std::snprintf(buf, max, "lfo%d_%s", cc < 88 ? 1 : 2, LFO[(cc - 80) % 8]); return buf; }
     if (cc >= 100 && cc <= 102) return PRE[cc - 100];
     return nullptr;
 }
@@ -799,6 +836,19 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     feed_transport(w, n);
     for (int i = 0; i < NPARAMS; i++)
         if (w->release[i]) { w->release[i] = 0; w->held[i] = false; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
+    if ((++w->edit_scan & 3) == 0) {   /* every 4th block: tell the host which EDIT cells changed (bounded per pass) */
+        int budget = 24;
+        for (int i = 0; i < NPARAMS; i++) {   /* the running lights first: they move every step */
+            if (!is_run_param(i)) continue;
+            float v = get_norm(w, i);
+            if (v != w->told[i]) { w->told[i] = v; w->master(&w->fx, audioMasterAutomate, i, 0, 0, v); }
+        }
+        for (int i = 0; i < NPARAMS && budget > 0; i++) {
+            if (!is_edit_param(i) || is_run_param(i)) continue;
+            float v = get_norm(w, i);
+            if (v != w->told[i]) { w->told[i] = v; w->master(&w->fx, audioMasterAutomate, i, 0, 0, v); budget--; }
+        }
+    }
 
     double t1 = now_ms(), dt = t1 - t0;
     w->blocks++; w->t_sum += dt;
@@ -879,11 +929,21 @@ static void setParameter(AEffect *e, int32_t i, float n) {
         w->cc_ch = (int)std::lround(clamp01(n) * (p->nopts - 1));
         return;
     }
+    if (is_run_param(i)) return;   /* display only */
+    if (is_edit_param(i)) {   /* a write that doesn't change the cell (a host restoring values, a tap on the same
+                               * value) must not lock the step */
+        char cur[32];
+        int cn;
+        { std::lock_guard<std::mutex> lk(w->lock); cn = g_api->get_param(w->inst, p->key, cur, sizeof cur); }
+        long nv = p->nopts ? std::lround(clamp01(n) * (p->nopts - 1)) : std::lround(p->min + (p->max - p->min) * clamp01(n));
+        if (cn > 0 && std::lround(std::atof(cur)) == nv) { w->told[i] = n; return; }
+    }
     norm_to_str(p, n, buf, sizeof buf);
     {
         std::lock_guard<std::mutex> lk(w->lock);
         g_api->set_param(w->inst, p->key, buf);
     }
+    if (is_edit_param(i)) w->told[i] = n;   /* the host already has this value: don't echo it back */
     if (!nudge) popup_picked(w->open, w->release, i);   /* a list pick closes it; a Q-Link nudge doesn't */
 }
 
@@ -1035,6 +1095,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     }
     Plugin *w = new Plugin();
     w->master = master;
+    for (int i = 0; i < NPARAMS; i++) w->told[i] = -1.0f;
     {
         std::lock_guard<std::mutex> lk(g_bank_lock);
         if (g_i_slot < 0) find_preset_params();

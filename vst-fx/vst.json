@@ -2,7 +2,7 @@
   "name": "Acid FX",
   "vendor": "sd88me",
   "uid": "AcFx",
-  "version": 1100,
+  "version": 1200,
   "so": "acid_fx.so",
   "effect": true,
   "module": "../vst/module.json",

@@ -53,7 +53,12 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include "acid_core.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define MAX_STEPS   32
 #define MIN_LENGTH  2
@@ -69,7 +74,18 @@
 #define ACID_MAX_TUNE 24     /* Seq B's interval from Seq A, +/- two octaves */
 #define ACID_MAX_TRANSPOSE 48
 
-typedef enum { STEP_REST = 0, STEP_NOTE = 1, STEP_ACCENT = 2, STEP_SLIDE = 3 } step_kind_t;
+/* STEP_ACCSLIDE (4) is both flags on one step, as on a real 303 (from upstream 2.0). The generators here still
+ * roll accent and slide as before (slide wins), so existing patterns sound the same; only the EDIT pages can set
+ * both on one step. */
+typedef enum { STEP_REST = 0, STEP_NOTE = 1, STEP_ACCENT = 2, STEP_SLIDE = 3, STEP_ACCSLIDE = 4 } step_kind_t;
+#define STEP_IS_ACCENT(k) ((k) == STEP_ACCENT || (k) == STEP_ACCSLIDE)
+#define STEP_IS_SLIDE(k)  ((k) == STEP_SLIDE  || (k) == STEP_ACCSLIDE)
+static uint8_t step_kind_of(int acc, int sld) { return (uint8_t)(acc && sld ? STEP_ACCSLIDE : acc ? STEP_ACCENT : sld ? STEP_SLIDE : STEP_NOTE); }
+static uint8_t step_drop_slide(uint8_t k) { return k == STEP_ACCSLIDE ? STEP_ACCENT : k == STEP_SLIDE ? STEP_NOTE : k; }
+
+/* EDIT pages: the NOTE slider's range in scale steps from the root (one scale octave below, five above) */
+#define EDIT_NOTE_MIN (-7)
+#define EDIT_NOTE_MAX 35
 
 /* Scale degrees in semitones from root -- ported verbatim from tb3po. */
 typedef struct { const char *name; int degrees[12]; int len; } scale_t;
@@ -147,7 +163,11 @@ typedef struct {
     /* Pattern */
     uint8_t steps[MAX_STEPS];
     uint8_t degrees[MAX_STEPS];
-    uint8_t octaves[MAX_STEPS];
+    int8_t octaves[MAX_STEPS];   /* signed: the EDIT page can go below the root */
+    /* EDIT pages (after upstream 2.0): a locked step keeps its stored note/kind whenever derive_pattern() re-reads
+     * the dice (knob moves, LFOs, Mutate, Scale). Hand edits lock a step; Generate/Regen/a loaded sequence clear. */
+    uint8_t locked[MAX_STEPS];
+    int edit_bar;       /* which 16 steps the EDIT page's cells show (0 or 1) */
 
     /* VST port -- LIVE KNOBS. Generate no longer bakes Density/Accent/Slide/
      * Octaves/Algo into the pattern; it only rolls the dice below, one set per
@@ -224,6 +244,7 @@ typedef struct {
     long dump_sample_accum;     /* accumulator toward the next dump step */
     int dump_last_note;         /* -1 = none; last dump note-on, for note-off */
     int dump_portamento_on;     /* separate from the live portamento_on */
+    uint32_t mod_sig;           /* MOD: signature of the modulated knob values the pattern is derived for (0 = the user's own) */
 } acid_seq_t;
 
 typedef struct {
@@ -285,6 +306,22 @@ typedef struct {
      * there. */
     float jitter;              /* 0.0..1.0: per-tick chance of perturbing WHICH
                                * step plays (not WHEN -- kept clear of swing) */
+    /* MOD page (taken over from upstream sd88me/mpc-vst-acid 2.0): two basic LFOs, each with two matrix slots
+     * (destination + amount). Modulation is applied around each 16th step on top of the user's own knob values,
+     * which are never changed (see advance_all), so knobs, presets and the saved project keep the user's settings. */
+    struct {
+        int shape;         /* 0 Sine 1 Tri 2 Saw 3 Square 4 S&H */
+        int rate;          /* 0-100: free rate 0.05..20 Hz, exponential */
+        int sync;          /* 1 = cycle length from the div, locked to the song's 16ths */
+        int div;           /* 0-6: cycle of 4, 8, 16, 32, 64, 128, 256 steps */
+        int dest[2];       /* 0 off, 1-7 A (density accent slide octaves length gate offset), 8-14 B, 15 blend */
+        int amt[2];        /* -100..100 */
+        double phase;      /* free-running cycles */
+        long cyc;          /* current cycle, to pick a new S&H value */
+        float sh;          /* S&H value, -1..1 */
+        float value;       /* last output, -1..1 */
+    } lfo[2];
+    uint32_t lfo_rng;      /* S&H's own PRNG, so the LFOs never change what Generate/Mutate/Jitter draw */
 } acid_inst_t;
 
 static const host_api_v1_t *g_host = NULL;
@@ -325,7 +362,7 @@ static int die_index(float d, int n) {   /* 0..1 die -> 0..n-1 */
 static void tidy_steps(const acid_seq_t *s, uint8_t *st, uint8_t *deg, uint8_t *oct) {
     for (int i = 0; i < s->length; i++) {
         int nxt = (i + 1) % s->length;
-        if (st[i] == STEP_SLIDE && st[nxt] == STEP_REST) st[i] = STEP_NOTE;
+        if (STEP_IS_SLIDE(st[i]) && st[nxt] == STEP_REST) st[i] = step_drop_slide(st[i]);
     }
     int any = 0;
     for (int i = 0; i < s->length; i++) if (st[i] != STEP_REST) { any = 1; break; }
@@ -384,6 +421,7 @@ static void derive_secondary(const acid_seq_t *s, int scale_idx,
  * (tb3po's behaviour), 16 = all secondary. Cheap (a few compares per step),
  * called from set_param under the same lock as playback. */
 static void derive_pattern(acid_seq_t *s, int scale_idx) {
+    s->mod_sig = 0;   /* derived from the knobs as they are; advance_all() re-derives if an LFO moves them */
     uint8_t p_steps[MAX_STEPS], p_deg[MAX_STEPS], p_oct[MAX_STEPS];
     uint8_t x_steps[MAX_STEPS], x_deg[MAX_STEPS], x_oct[MAX_STEPS];
     memset(p_steps, 0, sizeof p_steps); memset(p_deg, 0, sizeof p_deg); memset(p_oct, 0, sizeof p_oct);
@@ -392,11 +430,17 @@ static void derive_pattern(acid_seq_t *s, int scale_idx) {
     float weight = (float)(s->algo - 1) / 15.0f;
     if (weight > 0.0f) derive_secondary(s, scale_idx, x_steps, x_deg, x_oct);
     for (int i = 0; i < MAX_STEPS; i++) {
+        if (s->locked[i]) continue;   /* a hand-edited step keeps what the EDIT page set */
         if (weight > 0.0f && s->d_mix[i] < weight) {
-            s->steps[i] = x_steps[i]; s->degrees[i] = x_deg[i]; s->octaves[i] = x_oct[i];
+            s->steps[i] = x_steps[i]; s->degrees[i] = x_deg[i]; s->octaves[i] = (int8_t)x_oct[i];
         } else {
-            s->steps[i] = p_steps[i]; s->degrees[i] = p_deg[i]; s->octaves[i] = p_oct[i];
+            s->steps[i] = p_steps[i]; s->degrees[i] = p_deg[i]; s->octaves[i] = (int8_t)p_oct[i];
         }
+    }
+    /* a generated slide into a locked rest is a no-op too */
+    for (int i = 0; i < s->length; i++) {
+        int nxt = (i + 1) % s->length;
+        if (!s->locked[i] && STEP_IS_SLIDE(s->steps[i]) && s->steps[nxt] == STEP_REST) s->steps[i] = step_drop_slide(s->steps[i]);
     }
 }
 
@@ -778,7 +822,7 @@ static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int pre
      * from the other sequencer while rhythm/slide/accent stay this one's. */
     const acid_seq_t *ps = &t->seq[pitch_seq];
     int note = note_for_step(ps, t->scale, t->root, t->live_transpose, play_idx(ps, ps->position));
-    int is_accent = (kind == STEP_ACCENT);
+    int is_accent = STEP_IS_ACCENT(kind);
     int vel;
     if (t->cv_mode) {
         vel = is_accent ? 127 : 1;
@@ -793,7 +837,7 @@ static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int pre
 
     uint8_t slide_cc = t->cv_mode ? 1 : 65;   /* FORCE-ONLY: Mod Wheel in CV Mode */
 
-    int was_slide = (prev_pos >= 0 && s->steps[play_idx(s, prev_pos)] == STEP_SLIDE);
+    int was_slide = (prev_pos >= 0 && STEP_IS_SLIDE(s->steps[play_idx(s, prev_pos)]));
 
     /* FORCE-ONLY: every 0x80/0x90/0xB0 status byte below uses s->out_ch
      * (a_channel/b_channel) instead of upstream's fixed OUT_CH. */
@@ -827,7 +871,7 @@ static int emit_step_for_seq(acid_inst_t *t, int seq_idx, int pitch_seq, int pre
     }
     s->last_note_on = note;
     s->gate_samples_remaining = (long)(t->samples_per_step * s->gate);
-    if (kind != STEP_SLIDE && s->hold > 0.0f && s->d_hold[pidx] < s->hold) {
+    if (!STEP_IS_SLIDE(kind) && s->hold > 0.0f && s->d_hold[pidx] < s->hold) {
         /* HOLD: tie through the rests that follow (counted in play order by emit, so DIR/Jitter/Offset
          * are respected); held through to the next step boundary rather than cut after Gate */
         s->tie_left = HOLD_MAX_TIE;
@@ -887,7 +931,7 @@ static int process_dump_for_seq(acid_inst_t *t, int seq_idx, int frames, int sam
     int pidx = play_idx(s, s->dump_pos);
     uint8_t kind = s->steps[pidx];
     int prev_pos = s->dump_pos - 1;   /* -1 on the first step -- no prior step to slide from */
-    int was_slide = (prev_pos >= 0 && s->steps[play_idx(s, prev_pos)] == STEP_SLIDE);
+    int was_slide = (prev_pos >= 0 && STEP_IS_SLIDE(s->steps[play_idx(s, prev_pos)]));
 
     if (kind == STEP_REST) {
         if (s->dump_portamento_on && count < max_out) {
@@ -902,7 +946,7 @@ static int process_dump_for_seq(acid_inst_t *t, int seq_idx, int frames, int sam
         }
     } else {
         int note = note_for_step(s, t->scale, t->root, t->live_transpose, pidx);
-        int is_accent = (kind == STEP_ACCENT);
+        int is_accent = STEP_IS_ACCENT(kind);
         int vel = is_accent ? 118 : 72;
 
         if (was_slide) {
@@ -1010,7 +1054,7 @@ static int song_position(const acid_seq_t *s, long n) {
     }
 }
 
-static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], int max_out) {
+static int advance_all_inner(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], int max_out) {
     int count = 0;
 
     long k = t->song_step;
@@ -1048,6 +1092,7 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
             if (locked ? (k > 0 && k % AUTO_GEN_BAR_STEPS[s->auto_gen_idx - 1] == 0)
                        : s->auto_gen_step_count >= AUTO_GEN_BAR_STEPS[s->auto_gen_idx - 1]) {
                 s->auto_gen_step_count = 0;
+                memset(s->locked, 0, sizeof s->locked);
                 regenerate_pattern(s, t->scale, rng_next_u32(&s->rng));
                 if (s->position >= s->length) s->position = s->length - 1;
             }
@@ -1138,6 +1183,99 @@ static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], in
 }
 
 /* ---------------------------------------------------------------------- */
+/* MOD page: two LFOs (after upstream 2.0's MOD tab, adapted to this fork's  */
+/* dice-based live knobs: derive_pattern() instead of rederive_pattern(),   */
+/* OCTAVES 1..5)                                                            */
+/* ---------------------------------------------------------------------- */
+
+static const int LFO_DIV_STEPS[7] = { 4, 8, 16, 32, 64, 128, 256 };
+
+static float lfo_step(acid_inst_t *t, int n, long step) {
+    __typeof__(t->lfo[0]) *l = &t->lfo[n];
+    double p;
+    long cyc;
+    if (l->sync) {
+        long N = LFO_DIV_STEPS[l->div < 0 ? 0 : l->div > 6 ? 6 : l->div];
+        if (step < 0) step = 0;
+        p = (double)(step % N) / (double)N;
+        cyc = step / N;
+    } else {
+        double hz = 0.05 * pow(400.0, l->rate / 100.0);
+        l->phase += hz * 60.0 / ((t->bpm > 20.0f ? t->bpm : 120.0f) * 4.0);   /* cycles per 16th */
+        if (l->phase > 1e6) l->phase -= 1e6;
+        cyc = (long)l->phase;
+        p = l->phase - (double)cyc;
+    }
+    if (cyc != l->cyc) { l->cyc = cyc; l->sh = (float)(rng_next_u32(&t->lfo_rng) >> 8) / (float)(1 << 23) - 1.0f; }
+    float v;
+    switch (l->shape) {
+        case 1:  v = p < 0.5 ? (float)(4 * p - 1) : (float)(3 - 4 * p); break;
+        case 2:  v = (float)(2 * p - 1); break;
+        case 3:  v = p < 0.5 ? 1.0f : -1.0f; break;
+        case 4:  v = l->sh; break;
+        default: v = (float)sin(2 * M_PI * p); break;
+    }
+    l->value = v;
+    return v;
+}
+
+static float clampf_(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* Run the LFOs one step, then play the step with each destination's knob value offset by LFO x amount. The
+ * user's values are restored afterwards, so knobs, presets and the saved project never see the modulation; the
+ * pattern itself is re-derived from the same dice whenever a modulated value that shapes it moves. */
+static int advance_all(acid_inst_t *t, uint8_t out_msgs[][3], int out_lens[], int max_out) {
+    int active = 0;
+    for (int n = 0; n < 2; n++) for (int j = 0; j < 2; j++) if (t->lfo[n].dest[j] && t->lfo[n].amt[j]) active = 1;
+    long step = t->song_step >= 0 ? t->song_step : t->swing_pulse_idx;   /* read before the inner call consumes it */
+    float lv[2] = { lfo_step(t, 0, step), lfo_step(t, 1, step) };
+    if (!active) {
+        for (int q = 0; q < NUM_SEQS; q++)
+            if (t->seq[q].mod_sig) derive_pattern(&t->seq[q], t->scale);   /* back to the knobs' own pattern */
+        return advance_all_inner(t, out_msgs, out_lens, max_out);
+    }
+    float d[NUM_SEQS][7] = {{0}};
+    float db = 0;
+    for (int n = 0; n < 2; n++)
+        for (int j = 0; j < 2; j++) {
+            int dest = t->lfo[n].dest[j];
+            float x = lv[n] * t->lfo[n].amt[j] / 100.0f;
+            if (dest >= 1 && dest <= 14) d[(dest - 1) / 7][(dest - 1) % 7] += x;
+            else if (dest == 15) db += x;
+        }
+    struct { float density, accent, slide, gate; int oct, len, off; } user[NUM_SEQS];
+    int ublend = t->blend;
+    for (int q = 0; q < NUM_SEQS; q++) {
+        acid_seq_t *s = &t->seq[q];
+        user[q].density = s->density; user[q].accent = s->accent; user[q].slide = s->slide; user[q].gate = s->gate;
+        user[q].oct = s->octave_range; user[q].len = s->length; user[q].off = s->offset;
+        s->density = clampf_(s->density + d[q][0], 0.0f, 1.0f);
+        s->accent = clampf_(s->accent + d[q][1], 0.0f, 1.0f);
+        s->slide = clampf_(s->slide + d[q][2], 0.0f, 1.0f);
+        s->octave_range = (int)lroundf(clampf_(s->octave_range + d[q][3] * 4.0f, 1.0f, 5.0f));
+        s->length = (int)lroundf(clampf_(s->length + d[q][4] * 30.0f, 2.0f, (float)MAX_STEPS));
+        s->gate = clampf_(s->gate + d[q][5], 0.05f, 1.0f);
+        int off = (int)lroundf(s->offset + d[q][6] * 31.0f);
+        s->offset = ((off % s->length) + s->length) % s->length;
+        uint32_t sig = ((uint32_t)lroundf(s->density * 255) << 24) ^ ((uint32_t)lroundf(s->accent * 255) << 16) ^
+                       ((uint32_t)lroundf(s->slide * 255) << 8) ^ ((uint32_t)s->octave_range << 5) ^ (uint32_t)s->length * 2654435761u;
+        sig |= 1;
+        if (sig != s->mod_sig) { derive_pattern(s, t->scale); s->mod_sig = sig; }
+        if (s->position >= s->length) s->position = s->length - 1;
+    }
+    t->blend = (int)lroundf(clampf_(t->blend + db * 127.0f, -63.0f, 64.0f));
+    int fired = advance_all_inner(t, out_msgs, out_lens, max_out);
+    for (int q = 0; q < NUM_SEQS; q++) {
+        acid_seq_t *s = &t->seq[q];
+        s->density = user[q].density; s->accent = user[q].accent; s->slide = user[q].slide; s->gate = user[q].gate;
+        s->octave_range = user[q].oct; s->length = user[q].len; s->offset = user[q].off;
+        if (s->position >= s->length) s->position = s->length - 1;
+    }
+    t->blend = ublend;
+    return fired;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Plugin API surface                                                     */
 /* ---------------------------------------------------------------------- */
 
@@ -1178,6 +1316,8 @@ static void *acid_create_instance(const char *module_dir, const char *config_jso
     t->running = 0;
     t->follow_transport = 1;
     t->song_step = -1;
+    t->lfo_rng = 0x2545F491u;
+    for (int n = 0; n < 2; n++) { t->lfo[n].rate = 40; t->lfo[n].div = 2; t->lfo[n].cyc = -1; }
     t->vel_rng = t->seq[SEQ_A].rng ^ 0xA5A5A5A5u;
     if (!t->vel_rng) t->vel_rng = 1;
 
@@ -1377,7 +1517,7 @@ static int acid_tick(void *instance, int frames, int sample_rate,
             s->gate_samples_remaining -= frames;
             if (s->gate_samples_remaining <= 0) {
                 s->gate_samples_remaining = 0;
-                if (s->steps[play_idx(s, s->position)] != STEP_SLIDE && count < max_out) {
+                if (!STEP_IS_SLIDE(s->steps[play_idx(s, s->position)]) && count < max_out) {
                     count += kill_seq_note(t, i, &out_msgs[count], &out_lens[count], max_out - count);
                 }
             }
@@ -1395,6 +1535,44 @@ static float parse_float(const char *s, float fallback) {
     return (float)strtod(s, NULL);
 }
 
+/* ---------------------------------------------------------------------- */
+/* EDIT pages (after upstream 2.0, on this fork's dice model)              */
+/* ---------------------------------------------------------------------- */
+
+/* NOTE cell value: scale steps from the root, negative = below it. */
+static int edit_note_value(const acid_seq_t *s, int scale_idx, int i) {
+    int v = (int)s->octaves[i] * SCALES[scale_idx].len + (int)s->degrees[i];
+    return v < EDIT_NOTE_MIN ? EDIT_NOTE_MIN : v > EDIT_NOTE_MAX ? EDIT_NOTE_MAX : v;
+}
+
+/* One EDIT-page cell write (cell 0..15 of the bar shown). Touching a step locks it; LOCK off hands the step
+ * back to the knobs at once. Cells past Length do nothing. */
+static void edit_cell_set(acid_seq_t *s, int scale_idx, int cell, const char *field, int v) {
+    int i = s->edit_bar * 16 + cell;
+    if (cell < 0 || cell > 15 || i >= s->length) return;
+    const scale_t *sc = &SCALES[scale_idx];
+    if (strcmp(field, "lock") == 0) {
+        if (v) { s->locked[i] = 1; return; }
+        if (s->locked[i]) { s->locked[i] = 0; derive_pattern(s, scale_idx); }
+        return;
+    }
+    if (strcmp(field, "gate") == 0) {
+        s->steps[i] = v ? (s->steps[i] == STEP_REST ? STEP_NOTE : s->steps[i]) : STEP_REST;   /* a rest keeps its note */
+    } else if (strcmp(field, "note") == 0) {
+        if (v < EDIT_NOTE_MIN) v = EDIT_NOTE_MIN;
+        if (v > EDIT_NOTE_MAX) v = EDIT_NOTE_MAX;
+        int deg = ((v % sc->len) + sc->len) % sc->len;
+        s->degrees[i] = (uint8_t)deg;
+        s->octaves[i] = (int8_t)((v - deg) / sc->len);
+    } else if (strcmp(field, "acc") == 0 || strcmp(field, "sld") == 0) {
+        if (s->steps[i] == STEP_REST) return;            /* nothing to accent or slide on a rest */
+        int acc = STEP_IS_ACCENT(s->steps[i]), sld = STEP_IS_SLIDE(s->steps[i]);
+        if (field[0] == 'a') acc = v ? 1 : 0; else sld = v ? 1 : 0;
+        s->steps[i] = step_kind_of(acc, sld);
+    } else return;
+    s->locked[i] = 1;
+}
+
 static void acid_set_param(void *instance, const char *key, const char *val) {
     acid_inst_t *t = (acid_inst_t *)instance;
     if (!t || !key) return;
@@ -1406,18 +1584,37 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
 
     if (seq_idx >= 0) {
         acid_seq_t *s = &t->seq[seq_idx];
-        if (strcmp(k, "generate") == 0) {
+        if (k[0] == 'e' && k[1] >= '0' && k[1] <= '9') {          /* EDIT cell: e<n>_gate|note|acc|sld|lock */
+            char *us = NULL;
+            int cell = (int)strtol(k + 1, &us, 10);
+            if (us && *us == '_') edit_cell_set(s, t->scale, cell, us + 1, (int)lroundf(parse_float(val, 0.0f)));
+        } else if (strcmp(k, "edit_bar") == 0) {
+            s->edit_bar = lroundf(parse_float(val, 0.0f)) ? 1 : 0;
+        } else if (strcmp(k, "locks") == 0) {                      /* project/preset: "idx.kind.deg.oct," per locked step */
+            memset(s->locked, 0, sizeof s->locked);
+            const char *q = val;
+            while (q && *q) {
+                int i, kd, dg, oc, used = 0;
+                if (sscanf(q, "%d.%d.%d.%d,%n", &i, &kd, &dg, &oc, &used) < 4 || !used) break;
+                if (i >= 0 && i < MAX_STEPS && kd >= 0 && kd <= 4 && dg >= 0 && dg < 12 && oc >= -8 && oc <= 8) {
+                    s->locked[i] = 1; s->steps[i] = (uint8_t)kd; s->degrees[i] = (uint8_t)dg; s->octaves[i] = (int8_t)oc;
+                }
+                q += used;
+            }
+            derive_pattern(s, t->scale);
+        } else if (strcmp(k, "generate") == 0) {
             uint32_t seed = rng_next_u32(&s->rng);
+            memset(s->locked, 0, sizeof s->locked);
             regenerate_pattern(s, t->scale, seed);
             if (s->position >= s->length) s->position = s->length - 1;
         } else if (strcmp(k, "seed") == 0) {   /* project reload: rebuild the pattern a saved Generate made */
             uint32_t seed = (uint32_t)strtoul(val, NULL, 10);
-            if (seed) { regenerate_pattern(s, t->scale, seed); if (s->position >= s->length) s->position = s->length - 1; }
+            if (seed) { memset(s->locked, 0, sizeof s->locked); regenerate_pattern(s, t->scale, seed); if (s->position >= s->length) s->position = s->length - 1; }
         } else if (strcmp(k, "mutate") == 0) {
             mutate_pattern(s, t->scale);
         } else if (strcmp(k, "dice") == 0) {
             /* VST port: restore a saved sequence (see dice_to_str) */
-            if (dice_from_str(s, val)) derive_pattern(s, t->scale);
+            if (dice_from_str(s, val)) { memset(s->locked, 0, sizeof s->locked); derive_pattern(s, t->scale); }   /* locks follow as "locks" */
         } else if (strcmp(k, "dump") == 0) {
             /* FORCE-ONLY: (re)start this seq's Export dump player -- see
              * process_dump_for_seq(). Always restarts from step 0, even if
@@ -1529,6 +1726,18 @@ static void acid_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strncmp(key, "lfo", 3) == 0 && (key[3] == '1' || key[3] == '2') && key[4] == '_') {   /* MOD page */
+        __typeof__(t->lfo[0]) *l = &t->lfo[key[3] - '1'];
+        const char *m = key + 5;
+        int v = (int)lroundf(parse_float(val, 0.0f));
+        if (strcmp(m, "shape") == 0) l->shape = v < 0 ? 0 : v > 4 ? 4 : v;
+        else if (strcmp(m, "rate") == 0) l->rate = v < 0 ? 0 : v > 100 ? 100 : v;
+        else if (strcmp(m, "sync") == 0) l->sync = v ? 1 : 0;
+        else if (strcmp(m, "div") == 0) l->div = v < 0 ? 0 : v > 6 ? 6 : v;
+        else if (m[0] == 'd' && (m[1] == '1' || m[1] == '2') && !m[2]) l->dest[m[1] - '1'] = v < 0 ? 0 : v > 15 ? 15 : v;
+        else if (m[0] == 'a' && (m[1] == '1' || m[1] == '2') && !m[2]) l->amt[m[1] - '1'] = v < -100 ? -100 : v > 100 ? 100 : v;
+        return;
+    }
     if (strcmp(key, "root") == 0) {
         int v = parse_int(val, 9) % 12; if (v < 0) v += 12; t->root = v;
     } else if (strcmp(key, "scale") == 0) {
@@ -1601,6 +1810,33 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
         else if (strcmp(k, "dir") == 0) n = snprintf(buf, buf_len, "%d", s->dir);
         else if (strcmp(k, "pos") == 0) n = snprintf(buf, buf_len, "%d", s->position);   /* test hook */
         else if (strcmp(k, "seed") == 0) n = snprintf(buf, buf_len, "%u", (unsigned)s->seed);
+        else if (strcmp(k, "run") == 0) n = snprintf(buf, buf_len, "%d", play_idx(s, s->position) + 1);   /* 1-based step playing now (EDIT page's running light) */
+        else if (strcmp(k, "edit_bar") == 0) n = snprintf(buf, buf_len, "%d", s->edit_bar);
+        else if (strcmp(k, "locks") == 0) {
+            n = 0;
+            buf[0] = 0;
+            for (int i = 0; i < MAX_STEPS; i++) {
+                if (!s->locked[i]) continue;
+                int w = snprintf(buf + n, buf_len - n, "%d.%d.%d.%d,", i, s->steps[i], s->degrees[i], s->octaves[i]);
+                if (w < 0 || n + w >= buf_len) break;
+                n += w;
+            }
+            return n;
+        }
+        else if (k[0] == 'e' && k[1] >= '0' && k[1] <= '9') {
+            char *us = NULL;
+            int cell = (int)strtol(k + 1, &us, 10);
+            int i = s->edit_bar * 16 + cell;
+            if (!us || *us != '_' || cell < 0 || cell > 15 || i >= MAX_STEPS) return -1;
+            const char *f = us + 1;
+            int inl = i < s->length;
+            if (strcmp(f, "note") == 0) n = snprintf(buf, buf_len, "%d", inl ? edit_note_value(s, t->scale, i) : 0);
+            else if (strcmp(f, "gate") == 0) n = snprintf(buf, buf_len, "%d", inl && s->steps[i] != STEP_REST);
+            else if (strcmp(f, "acc") == 0) n = snprintf(buf, buf_len, "%d", inl && STEP_IS_ACCENT(s->steps[i]));
+            else if (strcmp(f, "sld") == 0) n = snprintf(buf, buf_len, "%d", inl && STEP_IS_SLIDE(s->steps[i]));
+            else if (strcmp(f, "lock") == 0) n = snprintf(buf, buf_len, "%d", inl && s->locked[i]);
+            else return -1;
+        }
         else if (strcmp(k, "channel") == 0) n = snprintf(buf, buf_len, "%d", s->out_ch + 1);  /* FORCE-ONLY */
         else if (strcmp(k, "auto_gen") == 0) n = snprintf(buf, buf_len, "%d", s->auto_gen_idx);  /* FORCE-ONLY */
         else if (strcmp(k, "generate") == 0 || strcmp(k, "mutate") == 0 || strcmp(k, "dump") == 0) n = snprintf(buf, buf_len, "off");
@@ -1610,6 +1846,21 @@ static int acid_get_param(void *instance, const char *key, char *buf, int buf_le
         return n;
     }
 
+    if (strncmp(key, "lfo", 3) == 0 && (key[3] == '1' || key[3] == '2') && key[4] == '_') {   /* MOD page */
+        __typeof__(t->lfo[0]) *l = &t->lfo[key[3] - '1'];
+        const char *m = key + 5;
+        int v;
+        if (strcmp(m, "shape") == 0) v = l->shape;
+        else if (strcmp(m, "rate") == 0) v = l->rate;
+        else if (strcmp(m, "sync") == 0) v = l->sync;
+        else if (strcmp(m, "div") == 0) v = l->div;
+        else if (m[0] == 'd' && (m[1] == '1' || m[1] == '2') && !m[2]) v = l->dest[m[1] - '1'];
+        else if (m[0] == 'a' && (m[1] == '1' || m[1] == '2') && !m[2]) v = l->amt[m[1] - '1'];
+        else return -1;
+        int n = snprintf(buf, buf_len, "%d", v);
+        if (n < 0) return -1;
+        return n >= buf_len ? buf_len - 1 : n;
+    }
     if (strcmp(key, "root") == 0) n = snprintf(buf, buf_len, "%d", t->root);
     else if (strcmp(key, "scale") == 0) n = snprintf(buf, buf_len, "%d", t->scale);
     else if (strcmp(key, "blend") == 0) n = snprintf(buf, buf_len, "%d", t->blend);
